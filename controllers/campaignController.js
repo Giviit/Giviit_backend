@@ -233,10 +233,15 @@ async function reportCampaign(req, res, next) {
   }
 }
 
-async function inviteCoOwner(req, res) {
+async function inviteCoOwner(req, res, next) {
   try {
     const { id } = req.params;
     const { email } = req.body;
+
+    const { data: campaign, error: getError } = await supabase.from('campaigns').select('creator_id').eq('id', id).single();
+    if (getError) return res.status(404).json({ error: 'Campaign not found' });
+    if (campaign.creator_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
     const token = uuidv4();
     const { error } = await supabase
       .from('campaign_members')
@@ -250,24 +255,34 @@ async function inviteCoOwner(req, res) {
     });
     res.json({ message: 'Invitation sent' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 }
 
-async function removeCoOwner(req, res) {
+async function removeCoOwner(req, res, next) {
   try {
     const { id, userId } = req.params;
+
+    const { data: campaign, error: getError } = await supabase.from('campaigns').select('creator_id').eq('id', id).single();
+    if (getError) return res.status(404).json({ error: 'Campaign not found' });
+    if (campaign.creator_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
     await supabase.from('campaign_members').delete().eq('campaign_id', id).eq('user_id', userId);
     res.json({ message: 'Removed' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 }
 
-async function saveMilestones(req, res) {
+async function saveMilestones(req, res, next) {
   try {
     const { id } = req.params;
     const { milestones } = req.body;
+
+    const { data: campaign, error: getError } = await supabase.from('campaigns').select('creator_id').eq('id', id).single();
+    if (getError) return res.status(404).json({ error: 'Campaign not found' });
+    if (campaign.creator_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
     await supabase.from('campaign_milestones').delete().eq('campaign_id', id);
     if (milestones?.length) {
       const rows = milestones.map((m, i) => ({ ...m, campaign_id: id, order_index: i }));
@@ -275,14 +290,19 @@ async function saveMilestones(req, res) {
     }
     res.json({ message: 'Milestones saved' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 }
 
-async function addGuarantor(req, res) {
+async function addGuarantor(req, res, next) {
   try {
     const { id } = req.params;
     const { guarantor_name, guarantor_email, guarantor_phone, guarantor_relationship } = req.body;
+
+    const { data: campaign, error: getError } = await supabase.from('campaigns').select('creator_id').eq('id', id).single();
+    if (getError) return res.status(404).json({ error: 'Campaign not found' });
+    if (campaign.creator_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
     const token = uuidv4();
     await supabase
       .from('campaigns')
@@ -296,11 +316,11 @@ async function addGuarantor(req, res) {
     });
     res.json({ message: 'Guarantor invited' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 }
 
-async function handleVouchGet(req, res) {
+async function handleVouchGet(req, res, next) {
   try {
     const { token } = req.params;
     const { data, error } = await supabase
@@ -311,11 +331,11 @@ async function handleVouchGet(req, res) {
     if (error || !data) return res.status(404).json({ error: 'Invalid token' });
     res.json({ campaign: data });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 }
 
-async function handleVouch(req, res) {
+async function handleVouch(req, res, next) {
   try {
     const { token } = req.params;
     const { message } = req.body;
@@ -326,28 +346,33 @@ async function handleVouch(req, res) {
     if (error) throw error;
     res.json({ message: 'Vouched successfully' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 }
 
-async function handleDeclineVouch(req, res) {
+async function handleDeclineVouch(req, res, next) {
   try {
     const { token } = req.params;
     await supabase.from('campaigns').update({ guarantor_status: 'declined' }).eq('guarantor_token', token);
     res.json({ message: 'Declined' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 }
 
-async function submitAppeal(req, res) {
+async function submitAppeal(req, res, next) {
   try {
     const { id } = req.params;
     const { message } = req.body;
+
+    const { data: campaign, error: getError } = await supabase.from('campaigns').select('creator_id').eq('id', id).single();
+    if (getError) return res.status(404).json({ error: 'Campaign not found' });
+    if (campaign.creator_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
     await supabase.from('campaigns').update({ appeal_message: message, appeal_status: 'pending' }).eq('id', id);
     res.json({ message: 'Appeal submitted' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 }
 

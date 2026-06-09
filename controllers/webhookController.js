@@ -114,9 +114,10 @@ async function handleTransferSuccess(data) {
     .update({ status: 'completed', updated_at: new Date().toISOString() })
     .eq('id', withdrawal.id);
 
+  const { data: camp } = await supabase.from('campaigns').select('withdrawn_amount').eq('id', withdrawal.campaign_id).single();
   await supabase
     .from('campaigns')
-    .update({ withdrawn_amount: supabase.raw(`withdrawn_amount + ${withdrawal.amount}`) })
+    .update({ withdrawn_amount: Number(camp?.withdrawn_amount || 0) + Number(withdrawal.amount) })
     .eq('id', withdrawal.campaign_id);
 
   await logAudit({ action: 'WITHDRAWAL_COMPLETED', entityType: 'withdrawal', entityId: withdrawal.id });

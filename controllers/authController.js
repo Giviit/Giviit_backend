@@ -1,7 +1,9 @@
-﻿const { supabase } = require('../utils/supabaseClient');
+﻿const jwt = require('jsonwebtoken');
+const { supabase } = require('../utils/supabaseClient');
 const { sendEmail } = require('../services/emailService');
 
 const CURRENT_TERMS_VERSION = '1.0';
+const RESET_TOKEN_EXPIRY = '1h';
 
 async function register(req, res, next) {
   try {
@@ -96,11 +98,34 @@ async function forgotPassword(req, res, next) {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email required' });
-    const { error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: `${process.env.FRONTEND_URL}/reset-password`,
+
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('id, full_name')
+      .eq('email', email)
+      .single();
+
+    // Always respond 200 to prevent email enumeration
+    if (!profile) return res.json({ message: 'If that email is registered, a reset link has been sent.' });
+
+    const token = jwt.sign(
+      { sub: profile.id, purpose: 'password_reset' },
+      process.env.JWT_SECRET,
+      { expiresIn: RESET_TOKEN_EXPIRY }
+    );
+
+    const resetUrl = `${process.env.FRONTEND_URL}/reset-password?token=${token}`;
+
+    await sendEmail({
+      to: email,
+      subject: 'Reset your Giviit password',
+      html: `<p>Hi ${profile.full_name},</p>
+<p>Click the link below to reset your password. This link expires in 1 hour.</p>
+<p><a href="${resetUrl}">Reset Password</a></p>
+<p>If you did not request this, ignore this email.</p>`,
     });
-    if (error) return res.status(400).json({ error: error.message });
-    res.json({ message: 'Password reset email sent' });
+
+    res.json({ message: 'If that email is registered, a reset link has been sent.' });
   } catch (err) {
     next(err);
   }
@@ -108,12 +133,28 @@ async function forgotPassword(req, res, next) {
 
 async function resetPassword(req, res, next) {
   try {
-    const { password, user_id } = req.body;
-    if (!password || !user_id) {
-      return res.status(400).json({ error: 'Missing user_id or password' });
+    const { token, password } = req.body;
+    if (!token || !password) {
+      return res.status(400).json({ error: 'Missing token or password' });
     }
-    const { error } = await supabase.auth.admin.updateUserById(user_id, { password });
-    if (error) return res.status(400).json({ error: error.message });
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    let payload;
+    try {
+      payload = jwt.verify(token, process.env.JWT_SECRET);
+    } catch {
+      return res.status(400).json({ error: 'Invalid or expired reset link. Please request a new one.' });
+    }
+
+    if (payload.purpose !== 'password_reset') {
+      return res.status(400).json({ error: 'Invalid reset token' });
+    }
+
+    const { error } = await supabase.auth.admin.updateUserById(payload.sub, { password });
+    if (error) return res.status(400).json({ error: 'Failed to reset password. Please try again.' });
+
     res.json({ message: 'Password reset successful' });
   } catch (err) {
     next(err);

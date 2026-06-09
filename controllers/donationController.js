@@ -107,10 +107,15 @@ async function getCampaignDonations(req, res, next) {
   }
 }
 
-async function logOfflineDonation(req, res) {
+async function logOfflineDonation(req, res, next) {
   try {
     const { campaign_id, donor_name, amount, note, donated_at } = req.body;
     const creator_id = req.user.id;
+
+    const { data: campaign } = await supabase.from('campaigns').select('creator_id').eq('id', campaign_id).single();
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+    if (campaign.creator_id !== creator_id) return res.status(403).json({ error: 'Forbidden' });
+
     const { data, error } = await supabase
       .from('offline_donations')
       .insert({
@@ -127,27 +132,34 @@ async function logOfflineDonation(req, res) {
     await supabase.rpc('increment_campaign_raised', { p_campaign_id: campaign_id, p_amount: amount });
     res.json({ offline_donation: data });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 }
 
-async function deleteOfflineDonation(req, res) {
+async function deleteOfflineDonation(req, res, next) {
   try {
     const { id } = req.params;
     const { data: od } = await supabase.from('offline_donations').select('*').eq('id', id).single();
-    if (od) {
-      await supabase.from('offline_donations').delete().eq('id', id);
-      await supabase.rpc('decrement_campaign_raised', { p_campaign_id: od.campaign_id, p_amount: od.amount });
-    }
+
+    if (!od) return res.status(404).json({ error: 'Not found' });
+    if (od.creator_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
+    await supabase.from('offline_donations').delete().eq('id', id);
+    await supabase.rpc('decrement_campaign_raised', { p_campaign_id: od.campaign_id, p_amount: od.amount });
     res.json({ message: 'Deleted' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 }
 
-async function getOfflineDonations(req, res) {
+async function getOfflineDonations(req, res, next) {
   try {
     const { campaign_id } = req.params;
+
+    const { data: campaign } = await supabase.from('campaigns').select('creator_id').eq('id', campaign_id).single();
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+    if (campaign.creator_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
     const { data, error } = await supabase
       .from('offline_donations')
       .select('*')
@@ -156,16 +168,16 @@ async function getOfflineDonations(req, res) {
     if (error) throw error;
     res.json({ offline_donations: data || [] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 }
 
-async function getDiasporaDonors(req, res) {
+async function getDiasporaDonors(req, res, next) {
   try {
     const { id } = req.params;
     const { data, error } = await supabase
       .from('donations')
-      .select('*')
+      .select('donor_name, donor_country, donor_currency, amount, is_anonymous, created_at')
       .eq('campaign_id', id)
       .not('donor_country', 'is', null)
       .neq('donor_currency', 'NGN')
@@ -174,7 +186,7 @@ async function getDiasporaDonors(req, res) {
     if (error) throw error;
     res.json({ diaspora_donors: data || [] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 }
 
