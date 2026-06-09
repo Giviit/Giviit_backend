@@ -120,6 +120,47 @@ async function resetPassword(req, res, next) {
   }
 }
 
+async function googleSync(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'No token provided' });
+    }
+    const token = authHeader.split(' ')[1];
+
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) return res.status(401).json({ error: 'Invalid or expired token' });
+
+    const { id, email } = user;
+    const full_name = user.user_metadata?.full_name || user.user_metadata?.name || email.split('@')[0];
+    const avatar_url = user.user_metadata?.avatar_url || user.user_metadata?.picture || null;
+
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .upsert(
+        {
+          id,
+          email,
+          full_name,
+          avatar_url,
+          role: 'user',
+          terms_agreed: true,
+          terms_agreed_at: new Date().toISOString(),
+          terms_version: CURRENT_TERMS_VERSION,
+        },
+        { onConflict: 'id' }
+      )
+      .select()
+      .single();
+
+    if (profileError) return res.status(400).json({ error: profileError.message });
+
+    return res.json({ token, user: { id, email, ...profile } });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function me(req, res, next) {
   try {
     const user = req.user;
@@ -159,4 +200,4 @@ async function updateProfile(req, res, next) {
   }
 }
 
-module.exports = { register, login, logout, forgotPassword, resetPassword, me, updateProfile };
+module.exports = { register, login, logout, forgotPassword, resetPassword, googleSync, me, updateProfile };
