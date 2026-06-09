@@ -18,8 +18,20 @@ dotenv.config();
 
 const app = express();
 
+const allowedOrigins = [
+  process.env.FRONTEND_URL || 'http://localhost:5173',
+  process.env.ADMIN_URL   || 'http://localhost:5174',
+];
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL || '*',
+  origin: (origin, callback) => {
+    // Allow server-to-server requests (no origin) and listed origins
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS: origin ${origin} not allowed`));
+    }
+  },
   credentials: true,
 }));
 
@@ -50,4 +62,4 @@ app.get('/health', (_req, res) => res.json({ status: 'ok', time: new Date().toIS
 app.use(errorHandler);
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Givia backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Giviit backend running on port ${PORT}`));

@@ -11,7 +11,7 @@ const client = axios.create({
 });
 
 async function initiateTransaction({ email, amount, campaign_id, donor_name, is_anonymous, message, prayer, currency }) {
-  const ref = `GIVIA_DON_${campaign_id.slice(0, 8)}_${Date.now()}`;
+  const ref = `GIVIIT_DON_${campaign_id.slice(0, 8)}_${Date.now()}`;
   const body = {
     email,
     amount: Math.round(Number(amount) * 100),
@@ -48,7 +48,7 @@ async function createTransferRecipient({ name, account_number, bank_code }) {
 }
 
 async function transferToRecipient({ amount, recipient, reason, reference }) {
-  const ref = reference || `GIVIA_WD_${Date.now()}`;
+  const ref = reference || `GIVIIT_WD_${Date.now()}`;
   const { data } = await client.post('/transfer', {
     source: 'balance',
     amount: Math.round(Number(amount) * 100),

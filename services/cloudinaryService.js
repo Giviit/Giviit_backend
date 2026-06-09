@@ -8,7 +8,7 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-async function uploadImage(base64Data, folder = 'Givia') {
+async function uploadImage(base64Data, folder = 'Giviit') {
   const result = await cloudinary.uploader.upload(base64Data, {
     folder,
     resource_type: 'image',

@@ -245,7 +245,7 @@ async function inviteCoOwner(req, res) {
     const acceptUrl = `${process.env.FRONTEND_URL}/campaigns/accept-invite/${token}`;
     await emailService.sendEmail({
       to: email,
-      subject: "You've been invited to co-manage a campaign on Givia",
+      subject: "You've been invited to co-manage a campaign on Giviit",
       html: `<p>You have been invited to co-manage a campaign. <a href="${acceptUrl}">Accept Invitation</a></p>`,
     });
     res.json({ message: 'Invitation sent' });
@@ -291,7 +291,7 @@ async function addGuarantor(req, res) {
     const vouchUrl = `${process.env.FRONTEND_URL}/vouch/${token}`;
     await emailService.sendEmail({
       to: guarantor_email,
-      subject: "You've been asked to vouch for a campaign on Givia",
+      subject: "You've been asked to vouch for a campaign on Giviit",
       html: `<p>${guarantor_name}, someone has nominated you as a guarantor for their fundraising campaign. <a href="${vouchUrl}">Click here to vouch or decline</a>.</p>`,
     });
     res.json({ message: 'Guarantor invited' });

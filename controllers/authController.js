@@ -1,11 +1,16 @@
 ﻿const { supabase } = require('../utils/supabaseClient');
 const { sendEmail } = require('../services/emailService');
 
+const CURRENT_TERMS_VERSION = '1.0';
+
 async function register(req, res, next) {
   try {
-    const { full_name, email, phone, password } = req.body;
+    const { full_name, email, phone, password, terms_agreed } = req.body;
     if (!email || !password || !full_name) {
       return res.status(400).json({ error: 'Missing required fields' });
+    }
+    if (!terms_agreed) {
+      return res.status(400).json({ error: 'You must agree to the Terms of Service, Privacy Policy, and Cookie Policy to create an account.' });
     }
 
     const { data, error } = await supabase.auth.admin.createUser({
@@ -22,6 +27,9 @@ async function register(req, res, next) {
       email,
       phone,
       role: 'user',
+      terms_agreed: true,
+      terms_agreed_at: new Date().toISOString(),
+      terms_version: CURRENT_TERMS_VERSION,
     }]);
 
     if (profileError) return res.status(400).json({ error: profileError.message });
@@ -29,7 +37,7 @@ async function register(req, res, next) {
     try {
       await sendEmail({
         to: email,
-        subject: 'Welcome to Givia',
+        subject: 'Welcome to Giviit',
         text: `Welcome ${full_name}! Your account has been created.`,
       });
     } catch {}
@@ -52,6 +60,13 @@ async function login(req, res, next) {
       .select('*')
       .eq('id', data.user.id)
       .single();
+
+    if (!profile?.terms_agreed) {
+      return res.status(403).json({
+        error: 'You must accept our Terms of Service, Privacy Policy, and Cookie Policy before signing in.',
+        code: 'TERMS_NOT_AGREED',
+      });
+    }
 
     const user = {
       id: data.user.id,

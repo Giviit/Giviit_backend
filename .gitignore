@@ -1,27 +1,59 @@
-# Dependencies
+# ── Dependencies ─────────────────────────────────────────────
 node_modules/
 
-# Environment variables
+# ── Environment variables — NEVER commit secrets ──────────────
 .env
 .env.local
 .env.*.local
+.env.development
+.env.production
+.env.staging
+# .env.example is safe to commit — keep it
 
-# Logs
+# ── Uploaded files ────────────────────────────────────────────
+uploads/
+tmp/
+
+# ── Logs ──────────────────────────────────────────────────────
 logs/
 *.log
 npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
-# Build output
+# ── Runtime / process ─────────────────────────────────────────
+pids/
+*.pid
+*.pid.lock
+
+# ── Databases (local dev) ─────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── SSL / keys — NEVER commit ─────────────────────────────────
+*.pem
+*.key
+*.cert
+*.crt
+*.p12
+*.pfx
+
+# ── Coverage ──────────────────────────────────────────────────
+coverage/
+.nyc_output/
+
+# ── Build output ──────────────────────────────────────────────
 dist/
 build/
 
-# OS files
+# ── OS files ──────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 
-# Editor directories
-.vscode/
+# ── Editor ────────────────────────────────────────────────────
+.vscode/*
+!.vscode/extensions.json
 .idea/
-
-# Coverage
-coverage/
+*.sw?

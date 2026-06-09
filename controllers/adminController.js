@@ -270,13 +270,13 @@ async function approveWithdrawal(req, res, next) {
       await supabase.from('withdrawals').update({ paystack_recipient_code: recipientCode }).eq('id', id);
     }
 
-    const transferRef = `GIVIA_WD_${id.slice(0, 8)}_${Date.now()}`;
+    const transferRef = `GIVIIT_WD_${id.slice(0, 8)}_${Date.now()}`;
     const { data: campaign } = await supabase.from('campaigns').select('title').eq('id', withdrawal.campaign_id).single();
 
     const transfer = await paystack.transferToRecipient({
       amount: withdrawal.amount,
       recipient: recipientCode,
-      reason: `Givia withdrawal — ${campaign?.title || id}`,
+      reason: `Giviit withdrawal — ${campaign?.title || id}`,
       reference: transferRef,
     });
 

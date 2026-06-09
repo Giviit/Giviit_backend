@@ -28,12 +28,12 @@ function wrap(body) {
   return `
     <div style="font-family:sans-serif;max-width:560px;margin:0 auto;background:#fff;border-radius:12px;border:1px solid #e5e7eb;overflow:hidden">
       <div style="background:linear-gradient(135deg,#1a7a4a,#22c55e);padding:28px 32px">
-        <h1 style="color:#fff;margin:0;font-size:22px;font-weight:900">Givia</h1>
+        <h1 style="color:#fff;margin:0;font-size:22px;font-weight:900">Giviit</h1>
         <p style="color:rgba(255,255,255,.7);margin:4px 0 0;font-size:12px;letter-spacing:.08em">TOGETHER WE RISE</p>
       </div>
       <div style="padding:32px">${body}</div>
       <div style="padding:16px 32px;background:#f9fafb;border-top:1px solid #e5e7eb">
-        <p style="margin:0;font-size:11px;color:#9ca3af">This email was sent by Givia · <a href="https://givia.ng" style="color:#1a7a4a">givia.ng</a></p>
+        <p style="margin:0;font-size:11px;color:#9ca3af">This email was sent by Giviit · <a href="https://giviit.ng" style="color:#1a7a4a">giviit.ng</a></p>
       </div>
     </div>`;
 }
@@ -41,10 +41,10 @@ function wrap(body) {
 async function welcomeEmail(user) {
   await sendEmail({
     to: user.email,
-    subject: `Welcome to Givia, ${user.full_name.split(' ')[0]}!`,
+    subject: `Welcome to Giviit, ${user.full_name.split(' ')[0]}!`,
     html: wrap(`
       <h2 style="margin:0 0 12px;color:#111827">Welcome, ${user.full_name.split(' ')[0]}! 🎉</h2>
-      <p style="color:#4b5563">Your Givia account is ready. Start a campaign in minutes and let your community support you.</p>
+      <p style="color:#4b5563">Your Giviit account is ready. Start a campaign in minutes and let your community support you.</p>
       <a href="${process.env.FRONTEND_URL}/dashboard" style="display:inline-block;margin-top:20px;padding:12px 24px;background:#1a7a4a;color:#fff;border-radius:8px;font-weight:700;text-decoration:none">Go to Dashboard</a>
     `),
   });
@@ -100,9 +100,9 @@ async function campaignFraudulent(to, { campaign_title, amount }) {
     subject: `Important: Refund processing — ${campaign_title}`,
     html: wrap(`
       <h2 style="margin:0 0 8px;color:#111827">Campaign removed — refund processing</h2>
-      <p style="color:#4b5563">We discovered that <strong>${campaign_title}</strong> did not meet Givia's trust standards.</p>
+      <p style="color:#4b5563">We discovered that <strong>${campaign_title}</strong> did not meet Giviit's trust standards.</p>
       <p style="color:#4b5563">Your donation of <strong>${fmt(amount)}</strong> is being refunded. Please allow <strong>3–5 business days</strong> for the funds to appear in your account.</p>
-      <p style="color:#4b5563">If you have questions, contact us at <a href="mailto:trust@givia.ng" style="color:#1a7a4a">trust@givia.ng</a>.</p>
+      <p style="color:#4b5563">If you have questions, contact us at <a href="mailto:trust@giviit.ng" style="color:#1a7a4a">trust@giviit.ng</a>.</p>
     `),
   });
 }
@@ -110,7 +110,7 @@ async function campaignFraudulent(to, { campaign_title, amount }) {
 async function withdrawalProcessing(to, { amount, bank_last4 }) {
   await sendEmail({
     to,
-    subject: 'Withdrawal processing — Givia',
+    subject: 'Withdrawal processing — Giviit',
     html: wrap(`
       <h2 style="margin:0 0 8px;color:#111827">Your withdrawal is processing</h2>
       <p style="color:#4b5563"><strong>${fmt(amount)}</strong> is being sent to your bank account ending in <strong>${bank_last4}</strong>.</p>
@@ -122,7 +122,7 @@ async function withdrawalProcessing(to, { amount, bank_last4 }) {
 async function withdrawalCompleted(to, { amount }) {
   await sendEmail({
     to,
-    subject: `₦${Number(amount).toLocaleString()} sent to your bank — Givia`,
+    subject: `₦${Number(amount).toLocaleString()} sent to your bank — Giviit`,
     html: wrap(`
       <h2 style="margin:0 0 8px;color:#111827">Funds sent! 💸</h2>
       <p style="color:#4b5563"><strong>${fmt(amount)}</strong> has been sent to your bank account. Check your bank for confirmation.</p>
@@ -133,12 +133,12 @@ async function withdrawalCompleted(to, { amount }) {
 async function withdrawalFailed(to, { amount, reason }) {
   await sendEmail({
     to,
-    subject: 'Withdrawal failed — Givia',
+    subject: 'Withdrawal failed — Giviit',
     html: wrap(`
       <h2 style="margin:0 0 8px;color:#111827">Withdrawal could not be processed</h2>
       <p style="color:#4b5563">Your withdrawal of <strong>${fmt(amount)}</strong> failed.</p>
       ${reason ? `<p style="color:#4b5563"><strong>Reason:</strong> ${reason}</p>` : ''}
-      <p style="color:#4b5563">Please contact <a href="mailto:support@givia.ng" style="color:#1a7a4a">support@givia.ng</a> for help.</p>
+      <p style="color:#4b5563">Please contact <a href="mailto:support@giviit.ng" style="color:#1a7a4a">support@giviit.ng</a> for help.</p>
     `),
   });
 }
@@ -172,7 +172,7 @@ async function sendAdminAlert(subject, data) {
   if (!adminEmail) return;
   await sendEmail({
     to: adminEmail,
-    subject: `[Givia Admin] ${subject}`,
+    subject: `[Giviit Admin] ${subject}`,
     html: wrap(`<h2>${subject}</h2><pre style="background:#f3f4f6;padding:16px;border-radius:8px;font-size:12px">${JSON.stringify(data, null, 2)}</pre>`),
   });
 }

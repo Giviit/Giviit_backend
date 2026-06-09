@@ -23,10 +23,10 @@ async function initiateKyc(req, res, next) {
 
     // Retry limit: max 3 attempts
     if ((existing?.attempt_count || 0) >= 3) {
-      return res.status(400).json({ error: 'Maximum verification attempts reached. Contact support at support@givia.ng' });
+      return res.status(400).json({ error: 'Maximum verification attempts reached. Contact support at support@giviit.ng' });
     }
 
-    const reference = `GIVIA_KYC_${userId.slice(0, 8)}_${Date.now()}`;
+    const reference = `GIVIIT_KYC_${userId.slice(0, 8)}_${Date.now()}`;
     const nameParts = req.user.full_name?.split(' ') || [];
 
     // Upsert KYC record
