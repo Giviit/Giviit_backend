@@ -12,6 +12,7 @@ const adminRoutes = require('./routes/adminRoutes');
 const pledgeRoutes = require('./routes/pledgeRoutes');
 const webhookRoutes = require('./routes/webhookRoutes');
 const kycRoutes = require('./routes/kycRoutes');
+const { getCampaignShareHTML } = require('./controllers/shareController');
 const { errorHandler } = require('./middleware/errorHandler');
 
 dotenv.config();
@@ -58,6 +59,10 @@ app.use('/api/webhooks/paystack', webhookRoutes);
 app.use('/api/kyc', kycRoutes);
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
+
+// Server-rendered preview page so link unfurlers (WhatsApp, Facebook, Telegram, etc.)
+// see the campaign's actual cover image — they don't execute the SPA's client-side JS.
+app.get('/share/campaign/:slug', getCampaignShareHTML);
 
 app.use(errorHandler);
 
