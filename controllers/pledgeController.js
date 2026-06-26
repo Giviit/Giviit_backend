@@ -1,8 +1,14 @@
 const { supabase } = require('../utils/supabaseClient');
 const { initiateTransaction } = require('../services/paystackService');
+const { getSettings } = require('../services/settingsService');
 
 exports.createPledge = async (req, res, next) => {
   try {
+    const { enablePledgeFeature } = await getSettings();
+    if (!enablePledgeFeature) {
+      return res.status(403).json({ error: 'Pledges are currently disabled on Giviit.' });
+    }
+
     const { campaign_id, donor_name, donor_email, total_amount, installment_amount, frequency, installments_total } = req.body;
     if (!campaign_id || !donor_name || !donor_email || !total_amount || !installments_total) {
       return res.status(400).json({ error: 'Missing required fields' });

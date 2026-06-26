@@ -12,8 +12,12 @@ const adminRoutes = require('./routes/adminRoutes');
 const pledgeRoutes = require('./routes/pledgeRoutes');
 const webhookRoutes = require('./routes/webhookRoutes');
 const kycRoutes = require('./routes/kycRoutes');
+const dashboardRoutes = require('./routes/dashboardRoutes');
+const settingsRoutes = require('./routes/settingsRoutes');
 const { getCampaignShareHTML } = require('./controllers/shareController');
+const { getStatusJSON, getStatusPage } = require('./controllers/statusController');
 const { errorHandler } = require('./middleware/errorHandler');
+const { getSettings } = require('./services/settingsService');
 
 dotenv.config();
 
@@ -48,6 +52,26 @@ app.use('/api/', limiter);
 app.use('/api/auth', authLimiter);
 app.use('/api/donations', donationLimiter);
 
+// Maintenance mode (toggled from Admin → Settings) blocks everything except
+// the admin panel itself, the public settings check, status/health checks,
+// and the Paystack webhook (so in-flight payments still get reconciled).
+// Paths here are relative to the '/api' mount point below (Express strips
+// the mount prefix from req.path for middleware mounted on a sub-path).
+const MAINTENANCE_EXEMPT_PREFIXES = ['/admin', '/settings', '/status', '/webhooks'];
+app.use('/api', async (req, res, next) => {
+  if (MAINTENANCE_EXEMPT_PREFIXES.some((p) => req.path.startsWith(p))) return next();
+  try {
+    const settings = await getSettings();
+    if (settings.maintenanceMode) {
+      return res.status(503).json({ error: 'Giviit is currently undergoing maintenance. Please check back shortly.', code: 'MAINTENANCE_MODE' });
+    }
+  } catch {
+    // Settings table missing/unreachable — fail open rather than taking the whole API down.
+  }
+  next();
+});
+
+app.use('/api/settings', settingsRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/campaigns', campaignRoutes);
 app.use('/api/donations', donationRoutes);
@@ -57,8 +81,14 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/pledges', pledgeRoutes);
 app.use('/api/webhooks/paystack', webhookRoutes);
 app.use('/api/kyc', kycRoutes);
+app.use('/api/dashboard', dashboardRoutes);
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
+
+// Status check — actually probes Supabase (and reports config presence for the
+// other integrations) instead of just confirming the process is alive.
+app.get('/status', getStatusPage);
+app.get('/api/status', getStatusJSON);
 
 // Server-rendered preview page so link unfurlers (WhatsApp, Facebook, Telegram, etc.)
 // see the campaign's actual cover image — they don't execute the SPA's client-side JS.

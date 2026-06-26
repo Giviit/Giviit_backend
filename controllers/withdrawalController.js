@@ -1,5 +1,6 @@
 const { supabase } = require('../utils/supabaseClient');
 const { calculateCampaignBalance } = require('../services/ledgerService');
+const { getSettings } = require('../services/settingsService');
 const { logAudit } = require('../utils/auditLog');
 const email = require('../services/emailService');
 
@@ -7,17 +8,20 @@ async function requestWithdrawal(req, res, next) {
   try {
     const { campaign_id, amount, bank_name, account_number, account_name, bank_code } = req.body;
     const creator_id = req.user.id;
+    const settings = await getSettings();
 
-    // KYC check
-    const { data: kyc } = await supabase
-      .from('kyc_verifications')
-      .select('status')
-      .eq('user_id', creator_id)
-      .eq('status', 'verified')
-      .single();
+    // KYC check (admin can switch this off platform-wide via Settings)
+    if (settings.requireKycForWithdrawal) {
+      const { data: kyc } = await supabase
+        .from('kyc_verifications')
+        .select('status')
+        .eq('user_id', creator_id)
+        .eq('status', 'verified')
+        .single();
 
-    if (!kyc) {
-      return res.status(403).json({ error: 'Complete identity verification (KYC) before withdrawing' });
+      if (!kyc) {
+        return res.status(403).json({ error: 'Complete identity verification (KYC) before withdrawing' });
+      }
     }
 
     // Ownership check
@@ -32,44 +36,47 @@ async function requestWithdrawal(req, res, next) {
     if (campaign.status !== 'active') return res.status(400).json({ error: 'Campaign is not active' });
 
     const withdrawAmount = Number(amount);
-    if (withdrawAmount < 1000) return res.status(400).json({ error: 'Minimum withdrawal is ₦1,000' });
-
-    // Live balance check
-    const balance = await calculateCampaignBalance(campaign_id);
-    if (withdrawAmount > balance.available) {
-      return res.status(400).json({
-        error: `Insufficient balance. Available: ₦${balance.available.toLocaleString()}`,
-        balance,
-      });
+    if (withdrawAmount < Number(settings.minWithdrawalAmount)) {
+      return res.status(400).json({ error: `Minimum withdrawal is ₦${Number(settings.minWithdrawalAmount).toLocaleString()}` });
     }
 
-    const { data, error } = await supabase
-      .from('withdrawals')
-      .insert([{
-        campaign_id,
-        creator_id,
-        amount: withdrawAmount,
-        bank_name,
-        account_number,
-        account_name,
-        bank_code: bank_code || '',
-        status: 'pending',
-      }])
-      .select()
-      .single();
+    // Atomic balance check + insert via a Postgres function that locks the
+    // campaign row for the duration of the check, so two concurrent
+    // withdrawal requests can never both read the same "available" balance
+    // before either one commits (closes the double-withdrawal race).
+    const { data, error } = await supabase.rpc('request_withdrawal_atomic', {
+      p_campaign_id: campaign_id,
+      p_creator_id: creator_id,
+      p_amount: withdrawAmount,
+      p_bank_name: bank_name,
+      p_account_number: account_number,
+      p_account_name: account_name,
+      p_bank_code: bank_code || null,
+    });
 
-    if (error) throw error;
+    if (error) {
+      if (error.message?.includes('INSUFFICIENT_BALANCE')) {
+        const balance = await calculateCampaignBalance(campaign_id);
+        return res.status(400).json({
+          error: `Insufficient balance. Available: ₦${balance.available.toLocaleString()}`,
+          balance,
+        });
+      }
+      throw error;
+    }
 
     await logAudit({ action: 'WITHDRAWAL_REQUESTED', entityType: 'withdrawal', entityId: data.id, performedBy: creator_id, metadata: { amount: withdrawAmount, campaign_id } });
 
-    try {
-      await email.sendAdminAlert('New withdrawal request', {
-        creator: req.user.full_name,
-        campaign: campaign.title,
-        amount: withdrawAmount,
-        bank: `${bank_name} ${account_number}`,
-      });
-    } catch {}
+    if (settings.emailOnWithdrawal) {
+      try {
+        await email.sendAdminAlert('New withdrawal request', {
+          creator: req.user.full_name,
+          campaign: campaign.title,
+          amount: withdrawAmount,
+          bank: `${bank_name} ${account_number}`,
+        });
+      } catch {}
+    }
 
     res.status(201).json({ withdrawal: data });
   } catch (err) {

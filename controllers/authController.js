@@ -1,29 +1,48 @@
 ﻿const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const { supabase } = require('../utils/supabaseClient');
-const { sendEmail } = require('../services/emailService');
+const { createAuthClient } = require('../utils/supabaseAuthClient');
+const { sendEmail, sendAdminAlert } = require('../services/emailService');
+const { getSettings } = require('../services/settingsService');
 
 const CURRENT_TERMS_VERSION = '1.0';
 const RESET_TOKEN_EXPIRY = '1h';
 
+// NIN is sensitive PII — never store it in plaintext. A one-way hash still lets
+// us enforce "this identity can only verify one account" via a uniqueness check.
+function hashNin(nin) {
+  return crypto.createHash('sha256').update(nin).digest('hex');
+}
+
 async function register(req, res, next) {
   try {
-    const { full_name, email, phone, password, terms_agreed } = req.body;
+    const { allowNewRegistrations } = await getSettings();
+    if (!allowNewRegistrations) {
+      return res.status(403).json({ error: 'New registrations are temporarily closed. Please check back later.', code: 'REGISTRATIONS_CLOSED' });
+    }
+
+    const { full_name, email, phone, password, terms_agreed, identity_agreement_accepted } = req.body;
     if (!email || !password || !full_name) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
     if (!terms_agreed) {
       return res.status(400).json({ error: 'You must agree to the Terms of Service, Privacy Policy, and Cookie Policy to create an account.' });
     }
+    if (!identity_agreement_accepted) {
+      return res.status(400).json({ error: 'You must confirm the accuracy of your information and agree to our Anti-Fraud Policy to create an account.' });
+    }
 
     const { data, error } = await supabase.auth.admin.createUser({
       email,
       password,
       user_metadata: { full_name, phone, role: 'user' },
-      email_confirm: false,
+      // No email-confirmation page exists yet — confirm immediately so the user
+      // can sign in right after registering instead of hitting a dead end.
+      email_confirm: true,
     });
     if (error) return res.status(400).json({ error: error.message });
 
-    const { error: profileError } = await supabase.from('profiles').insert([{
+    const { data: profile, error: profileError } = await supabase.from('profiles').insert([{
       id: data.user.id,
       full_name,
       email,
@@ -32,9 +51,25 @@ async function register(req, res, next) {
       terms_agreed: true,
       terms_agreed_at: new Date().toISOString(),
       terms_version: CURRENT_TERMS_VERSION,
-    }]);
+      identity_agreement_accepted: true,
+      identity_agreement_accepted_at: new Date().toISOString(),
+    }]).select().single();
 
-    if (profileError) return res.status(400).json({ error: profileError.message });
+    if (profileError) {
+      // Don't leave an orphaned auth user with no profile — they'd be unable to
+      // register again with the same email, but also unable to log in.
+      await supabase.auth.admin.deleteUser(data.user.id);
+      return res.status(400).json({ error: profileError.message });
+    }
+
+    // Auto-login: mint a real session so the frontend can go straight to the
+    // dashboard, the same way email/password login works. Uses a throwaway
+    // client — signing in on the shared service-role client would downgrade
+    // every later query on it to this user's (RLS-limited) permissions.
+    const { data: session, error: sessionError } = await createAuthClient().auth.signInWithPassword({ email, password });
+    if (sessionError) {
+      return res.status(201).json({ message: 'Account created. Please log in.' });
+    }
 
     try {
       await sendEmail({
@@ -44,7 +79,11 @@ async function register(req, res, next) {
       });
     } catch {}
 
-    res.status(201).json({ message: 'Account created. Please check your email.' });
+    res.status(201).json({
+      token: session.session.access_token,
+      refresh_token: session.session.refresh_token,
+      user: { id: data.user.id, email, ...profile },
+    });
   } catch (err) {
     next(err);
   }
@@ -53,20 +92,31 @@ async function register(req, res, next) {
 async function login(req, res, next) {
   try {
     const { email, password } = req.body;
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    // Throwaway client — signing in on the shared service-role client would
+    // downgrade every later query on it to this user's (RLS-limited) permissions.
+    const { data, error } = await createAuthClient().auth.signInWithPassword({ email, password });
     if (error) return res.status(400).json({ error: error.message });
 
-    // Get profile
-    const { data: profile } = await supabase
+    // Get profile via the service-role client (bypasses RLS, never touched by sign-in)
+    const { data: profile, error: profileError } = await supabase
       .from('profiles')
       .select('*')
       .eq('id', data.user.id)
       .single();
 
+    if (profileError) return next(profileError);
+
     if (!profile?.terms_agreed) {
       return res.status(403).json({
         error: 'You must accept our Terms of Service, Privacy Policy, and Cookie Policy before signing in.',
         code: 'TERMS_NOT_AGREED',
+      });
+    }
+
+    if (!profile?.identity_agreement_accepted) {
+      return res.status(403).json({
+        error: 'You must confirm the accuracy of your information and agree to our Anti-Fraud Policy before signing in.',
+        code: 'IDENTITY_AGREEMENT_NOT_AGREED',
       });
     }
 
@@ -78,6 +128,7 @@ async function login(req, res, next) {
 
     return res.json({
       token: data.session.access_token,
+      refresh_token: data.session.refresh_token,
       user,
     });
   } catch (err) {
@@ -85,13 +136,31 @@ async function login(req, res, next) {
   }
 }
 
-async function logout(req, res, next) {
+async function refreshToken(req, res, next) {
   try {
-    await supabase.auth.signOut();
-    res.json({ message: 'Logged out' });
+    const { refresh_token } = req.body;
+    if (!refresh_token) return res.status(400).json({ error: 'Missing refresh token' });
+
+    // Throwaway client, same reason as login()/register() — never call a
+    // session-mutating auth method on the shared service-role client.
+    const { data, error } = await createAuthClient().auth.refreshSession({ refresh_token });
+    if (error || !data.session) {
+      return res.status(401).json({ error: 'Session expired. Please log in again.' });
+    }
+
+    res.json({
+      token: data.session.access_token,
+      refresh_token: data.session.refresh_token,
+    });
   } catch (err) {
     next(err);
   }
+}
+
+function logout(req, res) {
+  // Stateless bearer-token API — there's no server-side session to invalidate.
+  // The client just discards its token; this endpoint exists for symmetry.
+  res.json({ message: 'Logged out' });
 }
 
 async function forgotPassword(req, res, next) {
@@ -161,6 +230,74 @@ async function resetPassword(req, res, next) {
   }
 }
 
+// Step 1: browser hits this directly (window.location.href = .../auth/google).
+// We redirect to Supabase's GoTrue authorize endpoint, which runs the actual
+// Google OAuth handshake and redirects back to our bridge page below.
+function googleRedirect(req, res) {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  if (!supabaseUrl) {
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    return res.redirect(`${frontendUrl}/login?error=${encodeURIComponent('Google sign-in is not configured')}`);
+  }
+  const backendUrl = process.env.BACKEND_URL || 'http://localhost:5000';
+  // Carries the "user checked the agree box" signal through the redirect chain —
+  // Supabase appends the session token as a hash fragment to whatever we pass here.
+  const agreed = req.query.agreed === 'true' ? '?agreed=true' : '';
+  const redirectTo = `${backendUrl}/api/auth/google/bridge${agreed}`;
+  const authorizeUrl = `${supabaseUrl}/auth/v1/authorize?provider=google&redirect_to=${encodeURIComponent(redirectTo)}`;
+  res.redirect(authorizeUrl);
+}
+
+// Step 2: Supabase redirects here after Google approves, with the session token
+// in the URL *hash fragment* — fragments never reach the server, so this tiny
+// page reads it client-side, hands it to googleSync below to upsert the profile,
+// then forwards the same (real, Supabase-issued) access token to the frontend.
+function googleBridge(req, res) {
+  const backendUrl = process.env.BACKEND_URL || 'http://localhost:5000';
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!DOCTYPE html>
+<html><head><title>Signing in&hellip;</title></head>
+<body>
+<p>Signing you in&hellip;</p>
+<script>
+(function () {
+  var hash = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : window.location.hash;
+  var params = new URLSearchParams(hash);
+  var errorDesc = params.get('error_description') || params.get('error');
+  var accessToken = params.get('access_token');
+  var refreshToken = params.get('refresh_token');
+  var frontendUrl = ${JSON.stringify(frontendUrl)};
+  var agreed = new URLSearchParams(window.location.search).get('agreed') === 'true';
+
+  function fail(msg, code) {
+    var url = frontendUrl + '/login?error=' + encodeURIComponent(msg || 'Google sign-in failed');
+    if (code) url += '&code=' + encodeURIComponent(code);
+    window.location.href = url;
+  }
+
+  if (errorDesc) return fail(errorDesc);
+  if (!accessToken) return fail('Google sign-in failed');
+
+  fetch(${JSON.stringify(backendUrl)} + '/api/auth/google/sync?agreed=' + agreed, {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + accessToken },
+  })
+    .then(function (r) {
+      if (r.status === 403) return r.json().then(function (b) { fail(b.error, b.code); });
+      if (!r.ok) throw new Error('sync failed');
+      return r.json().then(function () {
+        var url = frontendUrl + '/auth/callback?token=' + encodeURIComponent(accessToken);
+        if (refreshToken) url += '&refresh_token=' + encodeURIComponent(refreshToken);
+        window.location.href = url;
+      });
+    })
+    .catch(function () { fail('Could not complete Google sign-in'); });
+})();
+</script>
+</body></html>`);
+}
+
 async function googleSync(req, res, next) {
   try {
     const authHeader = req.headers.authorization;
@@ -168,29 +305,44 @@ async function googleSync(req, res, next) {
       return res.status(401).json({ error: 'No token provided' });
     }
     const token = authHeader.split(' ')[1];
+    const agreed = req.query.agreed === 'true' || req.body?.agreed === true;
 
     const { data: { user }, error } = await supabase.auth.getUser(token);
     if (error || !user) return res.status(401).json({ error: 'Invalid or expired token' });
 
     const { id, email } = user;
+
+    // Google OAuth via Supabase creates the auth.users row automatically before
+    // we ever see this request — but we control whether a *profile* gets created,
+    // and the rest of the app requires a profile to treat someone as signed in
+    // (see authenticateUser middleware). So a missing profile + no consent =
+    // effectively blocked, exactly like email/password registration.
+    const { data: existing } = await supabase.from('profiles').select('id').eq('id', id).single();
+
+    if (!existing && !agreed) {
+      return res.status(403).json({
+        error: 'You must agree to the Terms of Service, Privacy Policy, Cookie Policy, and our Anti-Fraud Policy to create an account.',
+        code: 'TERMS_NOT_AGREED',
+      });
+    }
+
     const full_name = user.user_metadata?.full_name || user.user_metadata?.name || email.split('@')[0];
     const avatar_url = user.user_metadata?.avatar_url || user.user_metadata?.picture || null;
 
+    const payload = { id, email, full_name, avatar_url, role: 'user' };
+    if (!existing) {
+      // First-time signup, consent just given — record it. Never overwrite an
+      // existing user's consent record on subsequent logins.
+      payload.terms_agreed = true;
+      payload.terms_agreed_at = new Date().toISOString();
+      payload.terms_version = CURRENT_TERMS_VERSION;
+      payload.identity_agreement_accepted = true;
+      payload.identity_agreement_accepted_at = new Date().toISOString();
+    }
+
     const { data: profile, error: profileError } = await supabase
       .from('profiles')
-      .upsert(
-        {
-          id,
-          email,
-          full_name,
-          avatar_url,
-          role: 'user',
-          terms_agreed: true,
-          terms_agreed_at: new Date().toISOString(),
-          terms_version: CURRENT_TERMS_VERSION,
-        },
-        { onConflict: 'id' }
-      )
+      .upsert(payload, { onConflict: 'id' })
       .select()
       .single();
 
@@ -207,6 +359,82 @@ async function me(req, res, next) {
     const user = req.user;
     if (!user) return res.status(401).json({ error: 'Unauthorized' });
     res.json({ user });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function submitBanAppeal(req, res, next) {
+  try {
+    const { message } = req.body;
+    if (!req.user.is_banned) return res.status(400).json({ error: 'Your account is not currently suspended' });
+    if (req.user.ban_appeal_status === 'pending') return res.status(400).json({ error: 'An appeal is already under review' });
+    if (!message || message.trim().length < 20) {
+      return res.status(400).json({ error: 'Appeal message must be at least 20 characters' });
+    }
+
+    await supabase.from('profiles').update({
+      ban_appeal_message: message,
+      ban_appeal_status: 'pending',
+      ban_appeal_submitted_at: new Date().toISOString(),
+    }).eq('id', req.user.id);
+
+    try {
+      await sendAdminAlert('New account ban appeal', { user: req.user.email, message });
+    } catch {}
+
+    res.json({ message: 'Appeal submitted' });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function verifyIdentity(req, res, next) {
+  try {
+    const userId = req.user.id;
+    const { nin, selfie_url, id_document_url, identity_agreement_accepted } = req.body;
+
+    if (!nin || !/^\d{11}$/.test(nin)) {
+      return res.status(400).json({ error: 'NIN must be exactly 11 digits' });
+    }
+    if (!selfie_url || !id_document_url) {
+      return res.status(400).json({ error: 'Selfie and government ID photos are required' });
+    }
+    if (!identity_agreement_accepted) {
+      return res.status(400).json({ error: 'You must confirm the accuracy of your information and agree to our Anti-Fraud Policy.' });
+    }
+
+    const ninHash = hashNin(nin);
+
+    // Fraud check: the same identity can't verify a second, different account.
+    const { data: duplicates } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('nin', ninHash)
+      .neq('id', userId);
+
+    if (duplicates && duplicates.length > 0) {
+      return res.status(409).json({ error: 'This NIN is already linked to another Giviit account.' });
+    }
+
+    const { data: profile, error } = await supabase
+      .from('profiles')
+      .update({
+        nin: ninHash,
+        selfie_url,
+        id_document_url,
+        verification_status: 'pending',
+        verification_submitted_at: new Date().toISOString(),
+        identity_agreement_accepted: true,
+        identity_agreement_accepted_at: new Date().toISOString(),
+      })
+      .eq('id', userId)
+      .select()
+      .single();
+
+    if (error) return res.status(400).json({ error: error.message });
+
+    res.json({ message: 'Verification documents submitted. Review takes 24-48 hours.', user: { ...req.user, ...profile } });
   } catch (err) {
     next(err);
   }
@@ -241,4 +469,4 @@ async function updateProfile(req, res, next) {
   }
 }
 
-module.exports = { register, login, logout, forgotPassword, resetPassword, googleSync, me, updateProfile };
+module.exports = { register, login, logout, forgotPassword, resetPassword, refreshToken, googleRedirect, googleBridge, googleSync, me, updateProfile, verifyIdentity, submitBanAppeal };

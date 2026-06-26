@@ -1,5 +1,7 @@
 const nodemailer = require('nodemailer');
+const axios = require('axios');
 const dotenv = require('dotenv');
+const { generateReceiptPdf } = require('./receiptService');
 dotenv.config();
 
 let transporter;
@@ -12,12 +14,48 @@ if (process.env.SMTP_HOST) {
   });
 }
 
-async function sendEmail({ to, subject, html, text }) {
+// channel 'trust' routes through the second Gmail/Apps Script account
+// (fraud/ban-related emails), falling back to the default account if the
+// second one isn't configured yet.
+function appsScriptCreds(channel) {
+  if (channel === 'trust' && process.env.APPS_SCRIPT_EMAIL_URL_2) {
+    return { url: process.env.APPS_SCRIPT_EMAIL_URL_2, secret: process.env.APPS_SCRIPT_EMAIL_SECRET_2 };
+  }
+  return { url: process.env.APPS_SCRIPT_EMAIL_URL, secret: process.env.APPS_SCRIPT_EMAIL_SECRET };
+}
+
+async function sendViaAppsScript({ to, subject, html, text, attachments, channel }) {
+  const { url, secret } = appsScriptCreds(channel);
+  if (!url || !secret) return false;
+
+  const payload = { secret, to, subject, html, text };
+  const att = attachments?.[0];
+  if (att) {
+    payload.attachmentBase64 = Buffer.from(att.content).toString('base64');
+    payload.attachmentName = att.filename;
+    payload.attachmentType = 'application/pdf';
+  }
+
+  const { data } = await axios.post(url, payload, { headers: { 'Content-Type': 'application/json' } });
+  if (!data?.success) throw new Error(data?.error || 'Apps Script send failed');
+  return true;
+}
+
+async function sendEmail({ to, subject, html, text, attachments, channel }) {
+  const { url } = appsScriptCreds(channel);
+  if (url) {
+    try {
+      if (await sendViaAppsScript({ to, subject, html, text, attachments, channel })) return;
+    } catch (err) {
+      console.warn('[email] Apps Script send failed, falling back to SMTP:', err.message);
+    }
+  }
+
   if (!transporter) {
     console.warn('[email] No SMTP configured — skipping email to', to);
     return;
   }
-  await transporter.sendMail({ from: process.env.EMAIL_FROM, to, subject, html, text });
+  await transporter.sendMail({ from: process.env.EMAIL_FROM, to, subject, html, text, attachments });
 }
 
 function fmt(amount) {
@@ -50,7 +88,17 @@ async function welcomeEmail(user) {
   });
 }
 
-async function donorReceipt(to, { campaign_title, amount, reference, campaign_url }) {
+async function donorReceipt(to, { campaign_title, amount, reference, campaign_url, donor_name, is_anonymous, currency, donated_at }) {
+  let attachments;
+  try {
+    const pdfBuffer = await generateReceiptPdf({
+      reference, donor_name, donor_email: to, amount, currency, campaign_title, donated_at, is_anonymous,
+    });
+    attachments = [{ filename: `Giviit-Receipt-${reference}.pdf`, content: pdfBuffer }];
+  } catch (err) {
+    console.warn('[email] Failed to generate receipt PDF:', err.message);
+  }
+
   await sendEmail({
     to,
     subject: `Donation confirmed — ${campaign_title}`,
@@ -59,6 +107,24 @@ async function donorReceipt(to, { campaign_title, amount, reference, campaign_ur
       <p style="color:#4b5563">Your donation of <strong>${fmt(amount)}</strong> to <strong>${campaign_title}</strong> has been received.</p>
       <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:16px;margin:20px 0">
         <p style="margin:0;font-size:13px;color:#166534">Reference: <strong>${reference}</strong></p>
+      </div>
+      <p style="color:#9ca3af;font-size:13px">Your PDF receipt is attached to this email.</p>
+      <a href="${campaign_url}" style="display:inline-block;padding:12px 24px;background:#1a7a4a;color:#fff;border-radius:8px;font-weight:700;text-decoration:none">View Campaign</a>
+    `),
+    attachments,
+  });
+}
+
+async function creatorDonationReceived(to, { donor_name, amount, campaign_title, campaign_url, is_anonymous, total_raised, goal_amount }) {
+  const donorLabel = is_anonymous ? 'An anonymous donor' : (donor_name || 'A donor');
+  await sendEmail({
+    to,
+    subject: `New donation — ${fmt(amount)} for ${campaign_title}`,
+    html: wrap(`
+      <h2 style="margin:0 0 8px;color:#111827">You just received a donation! 🎉</h2>
+      <p style="color:#4b5563">${donorLabel} donated <strong>${fmt(amount)}</strong> to <strong>${campaign_title}</strong>.</p>
+      <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:16px;margin:20px 0">
+        <p style="margin:0;font-size:13px;color:#166534">Total raised so far: <strong>${fmt(total_raised)}</strong>${goal_amount ? ` of ${fmt(goal_amount)} goal` : ''}</p>
       </div>
       <a href="${campaign_url}" style="display:inline-block;padding:12px 24px;background:#1a7a4a;color:#fff;border-radius:8px;font-weight:700;text-decoration:none">View Campaign</a>
     `),
@@ -94,6 +160,63 @@ async function campaignRejected(to, { campaign_title, reason }) {
   });
 }
 
+async function campaignFlaggedForReview(to, { campaign_title }) {
+  await sendEmail({
+    to,
+    subject: `Campaign held for review — ${campaign_title}`,
+    html: wrap(`
+      <h2 style="margin:0 0 8px;color:#111827">Your campaign needs a quick review</h2>
+      <p style="color:#4b5563"><strong>${campaign_title}</strong> did not pass our automated fraud screening, so it's currently hidden from donors while our team takes a closer look.</p>
+      <p style="color:#4b5563">If you believe this is a mistake, you can submit an appeal from your dashboard and our team will review it within 24–48 hours.</p>
+      <a href="${process.env.FRONTEND_URL}/dashboard/campaigns" style="display:inline-block;margin-top:16px;padding:12px 24px;background:#1a7a4a;color:#fff;border-radius:8px;font-weight:700;text-decoration:none">View Campaign</a>
+    `),
+    channel: 'trust',
+  });
+}
+
+async function accountBanned(to, { reason }) {
+  await sendEmail({
+    to,
+    subject: 'Your Giviit account has been suspended',
+    html: wrap(`
+      <h2 style="margin:0 0 8px;color:#111827">Account suspended</h2>
+      <p style="color:#4b5563">Your Giviit account has been suspended.</p>
+      <div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:16px;margin:16px 0">
+        <p style="margin:0;color:#991b1b;font-size:13px"><strong>Reason:</strong> ${reason}</p>
+      </div>
+      <p style="color:#4b5563">If you believe this is a mistake, you can submit an appeal from your dashboard and our team will review it.</p>
+    `),
+    channel: 'trust',
+  });
+}
+
+async function banAppealApproved(to) {
+  await sendEmail({
+    to,
+    subject: 'Your Giviit account has been reinstated',
+    html: wrap(`
+      <h2 style="margin:0 0 8px;color:#111827">Account reinstated ✅</h2>
+      <p style="color:#4b5563">After reviewing your appeal, we've reinstated your Giviit account. You can now log in and continue using the platform.</p>
+      <a href="${process.env.FRONTEND_URL}/login" style="display:inline-block;margin-top:16px;padding:12px 24px;background:#1a7a4a;color:#fff;border-radius:8px;font-weight:700;text-decoration:none">Sign In</a>
+    `),
+    channel: 'trust',
+  });
+}
+
+async function banAppealRejected(to, { note }) {
+  await sendEmail({
+    to,
+    subject: 'Your account appeal was reviewed',
+    html: wrap(`
+      <h2 style="margin:0 0 8px;color:#111827">Appeal not approved</h2>
+      <p style="color:#4b5563">After reviewing your appeal, we've decided to keep your account suspended.</p>
+      ${note ? `<p style="color:#4b5563"><strong>Note from our team:</strong> ${note}</p>` : ''}
+      <p style="color:#4b5563">If you have further questions, contact <a href="mailto:trust@giviit.ng" style="color:#1a7a4a">trust@giviit.ng</a>.</p>
+    `),
+    channel: 'trust',
+  });
+}
+
 async function campaignFraudulent(to, { campaign_title, amount }) {
   await sendEmail({
     to,
@@ -104,6 +227,7 @@ async function campaignFraudulent(to, { campaign_title, amount }) {
       <p style="color:#4b5563">Your donation of <strong>${fmt(amount)}</strong> is being refunded. Please allow <strong>3–5 business days</strong> for the funds to appear in your account.</p>
       <p style="color:#4b5563">If you have questions, contact us at <a href="mailto:trust@giviit.ng" style="color:#1a7a4a">trust@giviit.ng</a>.</p>
     `),
+    channel: 'trust',
   });
 }
 
@@ -181,8 +305,13 @@ module.exports = {
   sendEmail,
   welcomeEmail,
   donorReceipt,
+  creatorDonationReceived,
   campaignApproved,
   campaignRejected,
+  campaignFlaggedForReview,
+  accountBanned,
+  banAppealApproved,
+  banAppealRejected,
   campaignFraudulent,
   withdrawalProcessing,
   withdrawalCompleted,

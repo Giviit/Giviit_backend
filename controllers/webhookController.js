@@ -3,6 +3,8 @@ const { supabase } = require('../utils/supabaseClient');
 const email = require('../services/emailService');
 const { checkFraudTriggers } = require('../services/fraudService');
 const { logAudit } = require('../utils/auditLog');
+const { recordDonationEntries, recordWithdrawalEntry } = require('../services/ledgerService');
+const { getSettings } = require('../services/settingsService');
 
 function verifySignature(rawBody, signature) {
   const hash = crypto
@@ -39,22 +41,26 @@ async function handleChargeSuccess(data) {
   const reference = data.reference;
   const amount = data.amount / 100;
 
-  const { data: donation } = await supabase
+  // Atomic conditional update — only succeeds (returns a row) if this call is
+  // the one that actually flips the status, so a race with the frontend's
+  // verify endpoint can never double-increment the campaign totals.
+  const { data: donation, error: updateError } = await supabase
     .from('donations')
-    .select('*')
+    .update({ paystack_status: 'success', paystack_transaction_id: data.id || null })
     .eq('paystack_reference', reference)
-    .single();
+    .neq('paystack_status', 'success')
+    .select()
+    .maybeSingle();
 
-  if (!donation || donation.paystack_status === 'success') return; // idempotent
-
-  await supabase
-    .from('donations')
-    .update({ paystack_status: 'success' })
-    .eq('paystack_reference', reference);
+  if (updateError) {
+    console.error('[Paystack webhook] Failed to update donation status:', updateError.message);
+    return;
+  }
+  if (!donation) return; // not found, or already processed by another request
 
   const { data: campaign } = await supabase
     .from('campaigns')
-    .select('raised_amount, donor_count, creator_id, title')
+    .select('raised_amount, donor_count, creator_id, title, slug, goal_amount')
     .eq('id', donation.campaign_id)
     .single();
 
@@ -64,6 +70,25 @@ async function handleChargeSuccess(data) {
       .from('campaigns')
       .update({ raised_amount: newRaised, donor_count: Number(campaign.donor_count || 0) + 1 })
       .eq('id', donation.campaign_id);
+
+    try {
+      await recordDonationEntries({
+        userId: campaign.creator_id,
+        campaignId: donation.campaign_id,
+        amount,
+        donationId: donation.id,
+        paystackReference: reference,
+      });
+    } catch (err) {
+      console.error('[ledger] Failed to record donation entries:', err.message);
+    }
+
+    await logAudit({
+      action: 'DONATION_SUCCEEDED',
+      entityType: 'donation',
+      entityId: donation.id,
+      metadata: { campaign_id: donation.campaign_id, amount, paystack_reference: reference, via: 'webhook' },
+    });
 
     // Check and update milestones
     const { data: milestones } = await supabase
@@ -85,18 +110,37 @@ async function handleChargeSuccess(data) {
     try {
       await checkFraudTriggers(donation.campaign_id, campaign.creator_id);
     } catch {}
-  }
 
-  // Donor receipt email
-  const campaignUrl = `${process.env.FRONTEND_URL}/campaign/${campaign?.slug || ''}`;
-  try {
-    await email.donorReceipt(donation.donor_email, {
-      campaign_title: campaign?.title || 'your campaign',
-      amount,
-      reference,
-      campaign_url: campaignUrl,
-    });
-  } catch {}
+    // Donor receipt + creator notification emails
+    const campaignUrl = `${process.env.FRONTEND_URL}/campaign/${campaign.slug || ''}`;
+    try {
+      await email.donorReceipt(donation.donor_email, {
+        campaign_title: campaign.title || 'your campaign',
+        amount,
+        reference,
+        campaign_url: campaignUrl,
+        donor_name: donation.donor_name,
+        is_anonymous: donation.is_anonymous,
+        currency: donation.currency,
+        donated_at: donation.created_at,
+      });
+    } catch {}
+
+    try {
+      const { data: creator } = await supabase.from('profiles').select('email').eq('id', campaign.creator_id).single();
+      if (creator?.email) {
+        await email.creatorDonationReceived(creator.email, {
+          donor_name: donation.donor_name,
+          is_anonymous: donation.is_anonymous,
+          amount,
+          campaign_title: campaign.title,
+          campaign_url: campaignUrl,
+          total_raised: newRaised,
+          goal_amount: campaign.goal_amount,
+        });
+      }
+    } catch {}
+  }
 }
 
 async function handleTransferSuccess(data) {
@@ -114,13 +158,19 @@ async function handleTransferSuccess(data) {
     .update({ status: 'completed', updated_at: new Date().toISOString() })
     .eq('id', withdrawal.id);
 
-  const { data: camp } = await supabase.from('campaigns').select('withdrawn_amount').eq('id', withdrawal.campaign_id).single();
-  await supabase
-    .from('campaigns')
-    .update({ withdrawn_amount: Number(camp?.withdrawn_amount || 0) + Number(withdrawal.amount) })
-    .eq('id', withdrawal.campaign_id);
+  try {
+    await recordWithdrawalEntry({
+      userId: withdrawal.creator_id,
+      campaignId: withdrawal.campaign_id,
+      amount: withdrawal.amount,
+      withdrawalId: withdrawal.id,
+      paystackReference: ref,
+    });
+  } catch (err) {
+    console.error('[ledger] Failed to record withdrawal entry:', err.message);
+  }
 
-  await logAudit({ action: 'WITHDRAWAL_COMPLETED', entityType: 'withdrawal', entityId: withdrawal.id });
+  await logAudit({ action: 'WITHDRAWAL_COMPLETED', entityType: 'withdrawal', entityId: withdrawal.id, performedBy: withdrawal.creator_id, metadata: { amount: withdrawal.amount } });
 
   try {
     await email.withdrawalCompleted(withdrawal.profiles?.email, { amount: withdrawal.amount });
@@ -146,7 +196,8 @@ async function handleTransferFailed(data) {
 
   try {
     await email.withdrawalFailed(withdrawal.profiles?.email, { amount: withdrawal.amount, reason: data.reason });
-    await email.sendAdminAlert('Transfer failed', { withdrawal_id: withdrawal.id, amount: withdrawal.amount });
+    const { emailOnWithdrawal } = await getSettings();
+    if (emailOnWithdrawal) await email.sendAdminAlert('Transfer failed', { withdrawal_id: withdrawal.id, amount: withdrawal.amount });
   } catch {}
 }
 

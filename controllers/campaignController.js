@@ -2,6 +2,9 @@
 const { generateSlug } = require('../services/slugService');
 const { v4: uuidv4 } = require('uuid');
 const emailService = require('../services/emailService');
+const { assessCampaignRisk } = require('../services/fraudDetectionService');
+const { notifyAdmins } = require('../services/notificationService');
+const { getSettings } = require('../services/settingsService');
 
 async function listCampaigns(req, res, next) {
   try {
@@ -107,7 +110,26 @@ async function createCampaign(req, res, next) {
       }
     }
 
+    const settings = await getSettings();
+    if (Number(goal_amount) > Number(settings.maxCampaignGoal)) {
+      return res.status(400).json({ error: `Campaign goals are capped at ₦${Number(settings.maxCampaignGoal).toLocaleString()}. For larger goals, please contact support@giviit.ng.` });
+    }
+
     const slug = generateSlug(title);
+    const candidate = {
+      title, description, story, cover_image,
+      goal_amount: Number(goal_amount), is_urgent: Boolean(is_urgent),
+    };
+
+    // Pattern-recognition / fraud risk check — campaigns that don't trip any
+    // rule go straight live; flagged ones are held for manual admin approval.
+    const { data: creator } = await supabase
+      .from('profiles')
+      .select('id, created_at, verification_status, bank_account_number')
+      .eq('id', creator_id)
+      .single();
+
+    const { score, reasons, requiresReview } = await assessCampaignRisk({ campaign: candidate, creator });
 
     const { data, error } = await supabase
       .from('campaigns')
@@ -123,7 +145,8 @@ async function createCampaign(req, res, next) {
         goal_amount: Number(goal_amount),
         deadline: deadline || null,
         is_urgent: Boolean(is_urgent),
-        status: 'pending',
+        status: requiresReview ? 'pending' : 'active',
+        fraud_risk_score: score,
         raised_amount: 0,
         donor_count: 0,
       }])
@@ -131,6 +154,35 @@ async function createCampaign(req, res, next) {
       .single();
 
     if (error) throw error;
+
+    if (requiresReview) {
+      if (reasons.length) {
+        await supabase.from('fraud_flags').insert(
+          reasons.map(r => ({ campaign_id: data.id, flag_type: r.flag_type, details: r.details, risk_score: score }))
+        );
+      }
+      if (settings.emailOnFraudFlag) {
+        await notifyAdmins({
+          type: 'fraud_flag',
+          title: 'Campaign held for manual review',
+          message: `"${data.title}" was held for review (risk score ${score}) — ${reasons[0]?.details || 'multiple risk signals detected'}`,
+          link: '/review-queue',
+          campaignId: data.id,
+        });
+      }
+      try {
+        await emailService.campaignFlaggedForReview(req.user.email, { campaign_title: data.title });
+      } catch {}
+    } else if (settings.emailOnNewCampaign) {
+      await notifyAdmins({
+        type: 'campaign_created',
+        title: 'New campaign published',
+        message: `"${data.title}" went live automatically. Review it whenever convenient.`,
+        link: '/campaigns',
+        campaignId: data.id,
+      });
+    }
+
     res.status(201).json({ campaign: data });
   } catch (err) {
     next(err);
@@ -149,6 +201,13 @@ async function updateCampaign(req, res, next) {
     const updates = {};
     allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
     updates.updated_at = new Date().toISOString();
+
+    if (updates.goal_amount !== undefined) {
+      const { maxCampaignGoal } = await getSettings();
+      if (Number(updates.goal_amount) > Number(maxCampaignGoal)) {
+        return res.status(400).json({ error: `Campaign goals are capped at ₦${Number(maxCampaignGoal).toLocaleString()}. For larger goals, please contact support@giviit.ng.` });
+      }
+    }
 
     const { data, error } = await supabase.from('campaigns').update(updates).eq('id', id).select().single();
     if (error) throw error;
@@ -279,9 +338,13 @@ async function saveMilestones(req, res, next) {
     const { id } = req.params;
     const { milestones } = req.body;
 
-    const { data: campaign, error: getError } = await supabase.from('campaigns').select('creator_id').eq('id', id).single();
+    const { data: campaign, error: getError } = await supabase.from('campaigns').select('creator_id, goal_amount').eq('id', id).single();
     if (getError) return res.status(404).json({ error: 'Campaign not found' });
     if (campaign.creator_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
+    if (milestones?.some(m => Number(m.amount) > Number(campaign.goal_amount))) {
+      return res.status(400).json({ error: 'A milestone amount cannot exceed the overall campaign goal.' });
+    }
 
     await supabase.from('campaign_milestones').delete().eq('campaign_id', id);
     if (milestones?.length) {
@@ -365,11 +428,47 @@ async function submitAppeal(req, res, next) {
     const { id } = req.params;
     const { message } = req.body;
 
-    const { data: campaign, error: getError } = await supabase.from('campaigns').select('creator_id').eq('id', id).single();
+    if (!message || message.trim().length < 20) {
+      return res.status(400).json({ error: 'Appeal message must be at least 20 characters' });
+    }
+
+    const { data: campaign, error: getError } = await supabase
+      .from('campaigns')
+      .select('creator_id, title, status, appeal_status')
+      .eq('id', id)
+      .single();
     if (getError) return res.status(404).json({ error: 'Campaign not found' });
     if (campaign.creator_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
 
-    await supabase.from('campaigns').update({ appeal_message: message, appeal_status: 'pending' }).eq('id', id);
+    if (!['pending', 'rejected'].includes(campaign.status)) {
+      return res.status(400).json({ error: 'Only campaigns held for review or rejected can be appealed' });
+    }
+    if (campaign.appeal_status === 'pending') {
+      return res.status(400).json({ error: 'An appeal is already under review for this campaign' });
+    }
+
+    await supabase.from('campaigns').update({
+      appeal_message: message,
+      appeal_status: 'pending',
+      appeal_submitted_at: new Date().toISOString(),
+    }).eq('id', id);
+
+    await notifyAdmins({
+      type: 'appeal',
+      title: 'Campaign appeal submitted',
+      message: `Creator appealed the hold on "${campaign.title}"`,
+      link: '/review-queue',
+      campaignId: id,
+    });
+
+    try {
+      await emailService.sendEmail({
+        to: req.user.email,
+        subject: `Appeal received — ${campaign.title}`,
+        html: `<p>We've received your appeal for "${campaign.title}". Our team will review it within 24–48 hours.</p>`,
+      });
+    } catch {}
+
     res.json({ message: 'Appeal submitted' });
   } catch (err) {
     next(err);

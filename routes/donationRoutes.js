@@ -5,6 +5,7 @@ const {
   initiateDonation,
   verifyDonation,
   getCampaignDonations,
+  getMyDonations,
   logOfflineDonation,
   deleteOfflineDonation,
   getOfflineDonations,
@@ -13,6 +14,7 @@ const {
 
 router.post('/initiate', initiateDonation);
 router.get('/verify/:reference', verifyDonation);
+router.get('/my', authenticateUser, getMyDonations);
 router.get('/campaign/:campaign_id', getCampaignDonations);
 
 // Offline donations

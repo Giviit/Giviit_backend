@@ -1,5 +1,6 @@
 const { supabase } = require('../utils/supabaseClient');
 const emailService = require('./emailService');
+const { getSettings } = require('./settingsService');
 
 async function checkFraudTriggers(campaignId, creatorId) {
   const flags = [];
@@ -57,7 +58,8 @@ async function checkFraudTriggers(campaignId, creatorId) {
     if (!existing) {
       await supabase.from('fraud_flags').insert({ campaign_id: campaignId, ...flag });
       try {
-        await emailService.sendAdminAlert('Fraud flag raised', { campaignId, ...flag });
+        const { emailOnFraudFlag } = await getSettings();
+        if (emailOnFraudFlag) await emailService.sendAdminAlert('Fraud flag raised', { campaignId, ...flag });
       } catch {}
     }
   }

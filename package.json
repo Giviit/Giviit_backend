@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "Giviit-backend",
   "version": "1.0.0",
   "main": "server.js",
@@ -17,7 +17,9 @@
     "express-rate-limit": "^6.8.0",
     "jsonwebtoken": "^9.0.2",
     "nodemailer": "^6.9.4",
-    "uuid": "^9.0.1"
+    "pdfkit": "^0.19.1",
+    "uuid": "^9.0.1",
+    "ws": "^8.21.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"

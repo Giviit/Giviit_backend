@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { authenticateUser } = require('../middleware/authenticateUser');
+const { blockBanned } = require('../middleware/blockBanned');
 const {
   listCampaigns,
   getFeatured,
@@ -32,11 +33,11 @@ router.get('/', (req, res, next) => {
   next();
 }, listCampaigns);
 
-router.post('/', authenticateUser, createCampaign);
+router.post('/', authenticateUser, blockBanned, createCampaign);
 
 // Slug route — must come after named routes
 router.get('/:slug', getCampaignBySlug);
-router.put('/:id', authenticateUser, updateCampaign);
+router.put('/:id', authenticateUser, blockBanned, updateCampaign);
 router.delete('/:id', authenticateUser, deleteCampaign);
 router.get('/:id/updates', getCampaignUpdates);
 router.post('/:id/update', authenticateUser, postUpdate);
