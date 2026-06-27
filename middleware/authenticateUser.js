@@ -30,6 +30,10 @@ async function authenticateUser(req, res, next) {
       ...profile,
     };
 
+    // Fire-and-forget — drives the frontend's "force relogin after N days
+    // idle" check (see AuthContext.jsx). Never blocks the request on this.
+    supabase.from('profiles').update({ last_active_at: new Date().toISOString() }).eq('id', userInfo.user.id).then(() => {}, () => {});
+
     next();
   } catch (err) {
     next(err);

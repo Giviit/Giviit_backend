@@ -17,4 +17,19 @@ async function uploadImage(base64Data, folder = 'Giviit') {
   return result.secure_url;
 }
 
-module.exports = { uploadImage };
+// Campaign verification documents (PDF/JPG/PNG) — uploaded to a private
+// folder, never resized/transformed, and resource_type 'raw' for non-image
+// files (e.g. PDFs) so Cloudinary stores them as-is.
+async function uploadDocument(base64Data, isPdf) {
+  const result = await cloudinary.uploader.upload(base64Data, {
+    folder: 'giviit/documents/private',
+    resource_type: isPdf ? 'raw' : 'image',
+  });
+  return { url: result.secure_url, publicId: result.public_id };
+}
+
+async function deleteDocument(publicId, isPdf) {
+  await cloudinary.uploader.destroy(publicId, { resource_type: isPdf ? 'raw' : 'image' });
+}
+
+module.exports = { uploadImage, uploadDocument, deleteDocument };

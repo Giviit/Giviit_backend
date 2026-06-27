@@ -88,7 +88,13 @@ async function welcomeEmail(user) {
   });
 }
 
-async function donorReceipt(to, { campaign_title, amount, reference, campaign_url, donor_name, is_anonymous, currency, donated_at }) {
+const PAYMENT_CHANNEL_LABELS = {
+  card: 'Card',
+  bank_transfer: 'Bank Transfer',
+  ussd: 'USSD',
+};
+
+async function donorReceipt(to, { campaign_title, amount, reference, campaign_url, donor_name, is_anonymous, currency, donated_at, payment_channel }) {
   let attachments;
   try {
     const pdfBuffer = await generateReceiptPdf({
@@ -99,6 +105,8 @@ async function donorReceipt(to, { campaign_title, amount, reference, campaign_ur
     console.warn('[email] Failed to generate receipt PDF:', err.message);
   }
 
+  const channelLabel = PAYMENT_CHANNEL_LABELS[payment_channel];
+
   await sendEmail({
     to,
     subject: `Donation confirmed — ${campaign_title}`,
@@ -107,6 +115,7 @@ async function donorReceipt(to, { campaign_title, amount, reference, campaign_ur
       <p style="color:#4b5563">Your donation of <strong>${fmt(amount)}</strong> to <strong>${campaign_title}</strong> has been received.</p>
       <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:16px;margin:20px 0">
         <p style="margin:0;font-size:13px;color:#166534">Reference: <strong>${reference}</strong></p>
+        ${channelLabel ? `<p style="margin:6px 0 0;font-size:13px;color:#166534">Payment method: <strong>${channelLabel}</strong></p>` : ''}
       </div>
       <p style="color:#9ca3af;font-size:13px">Your PDF receipt is attached to this email.</p>
       <a href="${campaign_url}" style="display:inline-block;padding:12px 24px;background:#1a7a4a;color:#fff;border-radius:8px;font-weight:700;text-decoration:none">View Campaign</a>
@@ -231,25 +240,25 @@ async function campaignFraudulent(to, { campaign_title, amount }) {
   });
 }
 
-async function withdrawalProcessing(to, { amount, bank_last4 }) {
+async function withdrawalProcessing(to, { amount, bank_last4, bank_name, account_name, campaign_title }) {
   await sendEmail({
     to,
-    subject: 'Withdrawal processing — Giviit',
+    subject: 'Withdrawal initiated — Giviit',
     html: wrap(`
-      <h2 style="margin:0 0 8px;color:#111827">Your withdrawal is processing</h2>
-      <p style="color:#4b5563"><strong>${fmt(amount)}</strong> is being sent to your bank account ending in <strong>${bank_last4}</strong>.</p>
-      <p style="color:#4b5563">This usually completes within a few hours during business days.</p>
+      <h2 style="margin:0 0 8px;color:#111827">Your withdrawal is on its way</h2>
+      <p style="color:#4b5563"><strong>${fmt(amount)}</strong>${campaign_title ? ` from "${campaign_title}"` : ''} is being sent to ${account_name ? `<strong>${account_name}</strong> at ` : ''}${bank_name ? `<strong>${bank_name}</strong> ` : 'your bank account '}ending in <strong>${bank_last4}</strong>.</p>
+      <p style="color:#4b5563">Expected arrival: 5–10 minutes. We'll email you once it lands.</p>
     `),
   });
 }
 
-async function withdrawalCompleted(to, { amount }) {
+async function withdrawalCompleted(to, { amount, bank_name, bank_last4 }) {
   await sendEmail({
     to,
-    subject: `₦${Number(amount).toLocaleString()} sent to your bank — Giviit`,
+    subject: `${fmt(amount)} sent to your account — Giviit`,
     html: wrap(`
-      <h2 style="margin:0 0 8px;color:#111827">Funds sent! 💸</h2>
-      <p style="color:#4b5563"><strong>${fmt(amount)}</strong> has been sent to your bank account. Check your bank for confirmation.</p>
+      <h2 style="margin:0 0 8px;color:#111827">Funds sent</h2>
+      <p style="color:#4b5563">Your withdrawal of <strong>${fmt(amount)}</strong> has been sent to ${bank_name ? `<strong>${bank_name}</strong> ` : 'your bank account '}${bank_last4 ? `ending in <strong>${bank_last4}</strong> ` : ''}. It should arrive within minutes.</p>
     `),
   });
 }
@@ -260,9 +269,9 @@ async function withdrawalFailed(to, { amount, reason }) {
     subject: 'Withdrawal failed — Giviit',
     html: wrap(`
       <h2 style="margin:0 0 8px;color:#111827">Withdrawal could not be processed</h2>
-      <p style="color:#4b5563">Your withdrawal of <strong>${fmt(amount)}</strong> failed.</p>
+      <p style="color:#4b5563">Your withdrawal of <strong>${fmt(amount)}</strong> could not be processed. Your balance has been restored.</p>
       ${reason ? `<p style="color:#4b5563"><strong>Reason:</strong> ${reason}</p>` : ''}
-      <p style="color:#4b5563">Please contact <a href="mailto:support@giviit.ng" style="color:#1a7a4a">support@giviit.ng</a> for help.</p>
+      <p style="color:#4b5563">Please try again or contact <a href="mailto:support@giviit.ng" style="color:#1a7a4a">support@giviit.ng</a> for help.</p>
     `),
   });
 }
@@ -287,6 +296,67 @@ async function kycFailed(to) {
       <h2 style="margin:0 0 8px;color:#111827">Verification unsuccessful</h2>
       <p style="color:#4b5563">We were unable to verify your identity. Please try again with a clearer ID document and ensure the selfie matches.</p>
       <a href="${process.env.FRONTEND_URL}/dashboard/kyc" style="display:inline-block;margin-top:16px;padding:12px 24px;background:#1a7a4a;color:#fff;border-radius:8px;font-weight:700;text-decoration:none">Try Again</a>
+    `),
+  });
+}
+
+async function pledgeReminder(to, { donor_name, campaign_title, installment_amount, installment_number, installments_total, due_date, pay_url }) {
+  const dueLabel = due_date ? new Date(due_date).toLocaleDateString('en-NG', { day: 'numeric', month: 'long' }) : 'soon';
+  await sendEmail({
+    to,
+    subject: `Reminder: your next pledge payment for ${campaign_title}`,
+    html: wrap(`
+      <h2 style="margin:0 0 8px;color:#111827">Hi ${donor_name?.split(' ')[0] || 'there'}, your next pledge payment is coming up</h2>
+      <p style="color:#4b5563">Payment ${installment_number} of ${installments_total} for <strong>${campaign_title}</strong> is due <strong>${dueLabel}</strong>.</p>
+      <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:16px;margin:20px 0">
+        <p style="margin:0;font-size:13px;color:#166534">Amount due: <strong>${fmt(installment_amount)}</strong></p>
+      </div>
+      <a href="${pay_url}" style="display:inline-block;padding:12px 24px;background:#1a7a4a;color:#fff;border-radius:8px;font-weight:700;text-decoration:none">Pay Now</a>
+      <p style="color:#9ca3af;font-size:13px;margin-top:16px">If you've changed your mind, no action is needed — just let the payment date pass.</p>
+    `),
+  });
+}
+
+// Overfunding is disallowed platform-wide — a campaign that hits its goal
+// always closes immediately, so this only ever fires in the "closed" state.
+async function goalReached(to, { campaign_title, goal_amount, raised_amount, campaign_url }) {
+  await sendEmail({
+    to,
+    subject: 'Goal reached! Withdraw your funds — Giviit',
+    html: wrap(`
+      <h2 style="margin:0 0 8px;color:#111827">Goal reached! 🎉</h2>
+      <p style="color:#4b5563"><strong>${campaign_title}</strong> has reached its goal of <strong>${fmt(goal_amount)}</strong>. You've raised <strong>${fmt(raised_amount)}</strong>.</p>
+      <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:16px;margin:16px 0">
+        <p style="margin:0;color:#166534;font-size:13px">Your campaign has been closed automatically. You can now withdraw your funds.</p>
+      </div>
+      <a href="${process.env.FRONTEND_URL}/dashboard/withdrawals" style="display:inline-block;padding:12px 24px;background:#1a7a4a;color:#fff;border-radius:8px;font-weight:700;text-decoration:none">Withdraw Funds</a>
+    `),
+  });
+}
+
+async function campaignClosed(to, { campaign_title, raised_amount }) {
+  await sendEmail({
+    to,
+    subject: 'Your Giviit campaign has closed',
+    html: wrap(`
+      <h2 style="margin:0 0 8px;color:#111827">Campaign closed</h2>
+      <p style="color:#4b5563">Your campaign <strong>${campaign_title}</strong> has officially closed.</p>
+      <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:16px;margin:16px 0">
+        <p style="margin:0;color:#166534;font-size:13px">Total raised: <strong>${fmt(raised_amount)}</strong></p>
+      </div>
+      <p style="color:#4b5563">You can now withdraw your funds from your dashboard.</p>
+      <a href="${process.env.FRONTEND_URL}/dashboard/withdrawals" style="display:inline-block;padding:12px 24px;background:#1a7a4a;color:#fff;border-radius:8px;font-weight:700;text-decoration:none">Withdraw Funds</a>
+    `),
+  });
+}
+
+async function donorGoalReached(to, { campaign_title }) {
+  await sendEmail({
+    to,
+    subject: `${campaign_title} reached its goal!`,
+    html: wrap(`
+      <h2 style="margin:0 0 8px;color:#111827">Campaign reached its goal 🎉</h2>
+      <p style="color:#4b5563"><strong>${campaign_title}</strong> has reached its goal. Thank you for your support.</p>
     `),
   });
 }
@@ -318,5 +388,9 @@ module.exports = {
   withdrawalFailed,
   kycVerified,
   kycFailed,
+  pledgeReminder,
+  goalReached,
+  campaignClosed,
+  donorGoalReached,
   sendAdminAlert,
 };

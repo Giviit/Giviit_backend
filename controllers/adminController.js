@@ -45,7 +45,7 @@ async function dashboardStats(req, res, next) {
       { count: totalDonations },
       { data: donationAmounts },
       { count: pendingVerifications },
-      { count: pendingWithdrawals },
+      { count: flaggedWithdrawals },
       { count: openReports },
       { count: totalUsers },
       { count: pendingKyc },
@@ -54,7 +54,10 @@ async function dashboardStats(req, res, next) {
       supabase.from('donations').select('*', { count: 'exact', head: true }).eq('paystack_status', 'success'),
       supabase.from('donations').select('amount').eq('paystack_status', 'success'),
       supabase.from('campaigns').select('*', { count: 'exact', head: true }).eq('status', 'pending'),
-      supabase.from('withdrawals').select('*', { count: 'exact', head: true }).eq('status', 'pending'),
+      // Withdrawals fire autonomously now (no admin approval gate), so the
+      // dashboard's old "pending withdrawals" count is replaced with flagged
+      // ones — that's the only withdrawal state still awaiting admin action.
+      supabase.from('withdrawals').select('*', { count: 'exact', head: true }).eq('is_flagged', true),
       supabase.from('reports').select('*', { count: 'exact', head: true }).eq('status', 'pending'),
       supabase.from('profiles').select('*', { count: 'exact', head: true }),
       supabase.from('kyc_verifications').select('*', { count: 'exact', head: true }).eq('status', 'pending'),
@@ -80,7 +83,7 @@ async function dashboardStats(req, res, next) {
       total_raised,
       platform_fees,
       pending_verifications: pendingVerifications || 0,
-      pending_withdrawals: pendingWithdrawals || 0,
+      flagged_withdrawals: flaggedWithdrawals || 0,
       open_reports: openReports || 0,
       total_users: totalUsers || 0,
       pending_kyc: pendingKyc || 0,
@@ -329,79 +332,27 @@ async function getWithdrawals(req, res, next) {
   }
 }
 
-async function approveWithdrawal(req, res, next) {
-  try {
-    const { id } = req.params;
-    const { data: withdrawal, error: wErr } = await supabase
-      .from('withdrawals')
-      .select('*, creator:profiles(email,full_name)')
-      .eq('id', id)
-      .single();
-    if (wErr) throw wErr;
-    if (withdrawal.status !== 'pending') return res.status(400).json({ error: 'Withdrawal is not pending' });
-
-    await supabase.from('withdrawals').update({ status: 'processing' }).eq('id', id);
-
-    // Create recipient if needed
-    let recipientCode = withdrawal.paystack_recipient_code;
-    if (!recipientCode) {
-      const recipient = await paystack.createTransferRecipient({
-        name: withdrawal.account_name,
-        account_number: withdrawal.account_number,
-        bank_code: withdrawal.bank_code,
-      });
-      recipientCode = recipient.recipient_code;
-      await supabase.from('withdrawals').update({ paystack_recipient_code: recipientCode }).eq('id', id);
-    }
-
-    const transferRef = `GIVIIT_WD_${id.slice(0, 8)}_${Date.now()}`;
-    const { data: campaign } = await supabase.from('campaigns').select('title').eq('id', withdrawal.campaign_id).single();
-
-    const transfer = await paystack.transferToRecipient({
-      amount: withdrawal.amount,
-      recipient: recipientCode,
-      reason: `Giviit withdrawal — ${campaign?.title || id}`,
-      reference: transferRef,
-    });
-
-    await supabase.from('withdrawals').update({
-      status: 'processing',
-      paystack_transfer_code: transfer.transfer_code,
-      paystack_transfer_reference: transferRef,
-      updated_at: new Date().toISOString(),
-    }).eq('id', id);
-
-    await logAudit({ action: 'WITHDRAWAL_APPROVED', entityType: 'withdrawal', entityId: id, performedBy: req.user.id, metadata: { amount: withdrawal.amount } });
-
-    const bankLast4 = String(withdrawal.account_number).slice(-4);
-    try {
-      await email.withdrawalProcessing(withdrawal.creator?.email, { amount: withdrawal.amount, bank_last4: bankLast4 });
-    } catch {}
-
-    res.json({ message: 'Transfer initiated', transfer_code: transfer.transfer_code });
-  } catch (err) {
-    await supabase.from('withdrawals').update({ status: 'failed', admin_note: err.message }).eq('id', req.params.id).catch(() => {});
-    next(err);
-  }
-}
-
-async function rejectWithdrawal(req, res, next) {
+// Withdrawals fire their Paystack transfer the instant a creator submits
+// them (see requestWithdrawal in withdrawalController.js) — there is no
+// admin approval gate any more. This is the one action admins retain: flag
+// a withdrawal as suspicious for the record. It does NOT pull back a
+// transfer that already went out (Paystack has no cancel-in-flight API for
+// a transfer once submitted) and does NOT ban the creator on its own —
+// that's a separate, deliberate admin action via the existing ban flow if
+// the flagged withdrawal warrants it.
+async function flagWithdrawal(req, res, next) {
   try {
     const { id } = req.params;
     const { note } = req.body;
     const { data, error } = await supabase
       .from('withdrawals')
-      .update({ status: 'failed', admin_note: note || 'Rejected by admin', updated_at: new Date().toISOString() })
+      .update({ is_flagged: true, admin_note: note || 'Flagged by admin for review', updated_at: new Date().toISOString() })
       .eq('id', id)
-      .select('*, creator:profiles(email)')
+      .select('*, creator:profiles(id,email,full_name)')
       .single();
     if (error) throw error;
 
-    await logAudit({ action: 'WITHDRAWAL_REJECTED', entityType: 'withdrawal', entityId: id, performedBy: req.user.id, metadata: { note } });
-
-    try {
-      await email.withdrawalFailed(data.creator?.email, { amount: data.amount, reason: note });
-    } catch {}
+    await logAudit({ action: 'WITHDRAWAL_FLAGGED', entityType: 'withdrawal', entityId: id, performedBy: req.user.id, metadata: { note } });
 
     res.json({ withdrawal: data });
   } catch (err) {
@@ -860,8 +811,7 @@ module.exports = {
   toggleFeature,
   toggleUrgent,
   getWithdrawals,
-  approveWithdrawal,
-  rejectWithdrawal,
+  flagWithdrawal,
   getReports,
   reviewReport,
   dismissReport,

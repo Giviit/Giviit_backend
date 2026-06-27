@@ -9,6 +9,7 @@ const {
   getCampaignBySlug,
   createCampaign,
   updateCampaign,
+  closeCampaign,
   deleteCampaign,
   postUpdate,
   getCampaignUpdates,
@@ -21,7 +22,13 @@ const {
   handleVouch,
   handleDeclineVouch,
   submitAppeal,
+  publishCampaign,
 } = require('../controllers/campaignController');
+const {
+  uploadCampaignDocument,
+  getCampaignDocumentsOwner,
+  deleteCampaignDocument,
+} = require('../controllers/documentController');
 
 // Static routes first
 router.get('/featured', getFeatured);
@@ -38,6 +45,7 @@ router.post('/', authenticateUser, blockBanned, createCampaign);
 // Slug route — must come after named routes
 router.get('/:slug', getCampaignBySlug);
 router.put('/:id', authenticateUser, blockBanned, updateCampaign);
+router.put('/:id/close', authenticateUser, closeCampaign);
 router.delete('/:id', authenticateUser, deleteCampaign);
 router.get('/:id/updates', getCampaignUpdates);
 router.post('/:id/update', authenticateUser, postUpdate);
@@ -58,5 +66,13 @@ router.post('/decline-vouch/:token', handleDeclineVouch);
 
 // Appeal
 router.post('/:id/appeal', authenticateUser, submitAppeal);
+
+// Publish (flips a 'draft' campaign live once required documents are attached)
+router.post('/:id/publish', authenticateUser, blockBanned, publishCampaign);
+
+// Verification documents (owner-only; admin reads via adminRoutes.js)
+router.post('/:id/documents', authenticateUser, uploadCampaignDocument);
+router.get('/:id/documents', authenticateUser, getCampaignDocumentsOwner);
+router.delete('/:id/documents/:doc_id', authenticateUser, deleteCampaignDocument);
 
 module.exports = router;

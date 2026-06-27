@@ -5,6 +5,9 @@ const { checkFraudTriggers } = require('../services/fraudService');
 const { logAudit } = require('../utils/auditLog');
 const { recordDonationEntries, recordWithdrawalEntry } = require('../services/ledgerService');
 const { getSettings } = require('../services/settingsService');
+const { advancePledge } = require('../services/pledgeService');
+const { initiateRefund } = require('../services/paystackService');
+const { capAmount, handleGoalReached } = require('../services/overfundingService');
 
 function verifySignature(rawBody, signature) {
   const hash = crypto
@@ -31,6 +34,8 @@ async function handlePaystackWebhook(req, res) {
       await handleTransferSuccess(event.data);
     } else if (event.event === 'transfer.failed') {
       await handleTransferFailed(event.data);
+    } else if (event.event === 'transfer.reversed') {
+      await handleTransferReversed(event.data);
     }
   } catch (err) {
     console.error('[Paystack webhook]', err.message);
@@ -60,22 +65,42 @@ async function handleChargeSuccess(data) {
 
   const { data: campaign } = await supabase
     .from('campaigns')
-    .select('raised_amount, donor_count, creator_id, title, slug, goal_amount')
+    .select('id, raised_amount, donor_count, creator_id, title, slug, goal_amount, goal_reached_at')
     .eq('id', donation.campaign_id)
     .single();
 
   if (campaign) {
-    const newRaised = Number(campaign.raised_amount || 0) + amount;
+    const previousRaised = Number(campaign.raised_amount || 0);
+    const goalAmount = Number(campaign.goal_amount || 0);
+
+    // Defensive re-cap — see donationController.verifyDonation for why this
+    // can still trigger even though initiateDonation already capped the charge.
+    const { cappedAmount, excessAmount } = capAmount(amount, previousRaised, goalAmount);
+    if (excessAmount > 0) {
+      try {
+        await initiateRefund({ transaction: reference, amount: excessAmount });
+      } catch (err) {
+        console.error('[overfunding] Failed to refund excess donation amount:', err.message);
+      }
+    }
+
+    const newRaised = previousRaised + cappedAmount;
     await supabase
       .from('campaigns')
       .update({ raised_amount: newRaised, donor_count: Number(campaign.donor_count || 0) + 1 })
       .eq('id', donation.campaign_id);
 
     try {
+      await handleGoalReached({ campaign, newRaised });
+    } catch (err) {
+      console.error('[overfunding] handleGoalReached failed:', err.message);
+    }
+
+    try {
       await recordDonationEntries({
         userId: campaign.creator_id,
         campaignId: donation.campaign_id,
-        amount,
+        amount: cappedAmount,
         donationId: donation.id,
         paystackReference: reference,
       });
@@ -87,7 +112,7 @@ async function handleChargeSuccess(data) {
       action: 'DONATION_SUCCEEDED',
       entityType: 'donation',
       entityId: donation.id,
-      metadata: { campaign_id: donation.campaign_id, amount, paystack_reference: reference, via: 'webhook' },
+      metadata: { campaign_id: donation.campaign_id, amount: cappedAmount, gross_amount: amount, paystack_reference: reference, via: 'webhook' },
     });
 
     // Check and update milestones
@@ -116,13 +141,14 @@ async function handleChargeSuccess(data) {
     try {
       await email.donorReceipt(donation.donor_email, {
         campaign_title: campaign.title || 'your campaign',
-        amount,
+        amount: cappedAmount,
         reference,
         campaign_url: campaignUrl,
         donor_name: donation.donor_name,
         is_anonymous: donation.is_anonymous,
         currency: donation.currency,
         donated_at: donation.created_at,
+        payment_channel: donation.payment_channel,
       });
     } catch {}
 
@@ -132,7 +158,7 @@ async function handleChargeSuccess(data) {
         await email.creatorDonationReceived(creator.email, {
           donor_name: donation.donor_name,
           is_anonymous: donation.is_anonymous,
-          amount,
+          amount: cappedAmount,
           campaign_title: campaign.title,
           campaign_url: campaignUrl,
           total_raised: newRaised,
@@ -140,6 +166,14 @@ async function handleChargeSuccess(data) {
         });
       }
     } catch {}
+
+    if (donation.pledge_id) {
+      try {
+        await advancePledge(donation.pledge_id);
+      } catch (err) {
+        console.error('[pledge] Failed to advance pledge:', err.message);
+      }
+    }
   }
 }
 
@@ -173,10 +207,19 @@ async function handleTransferSuccess(data) {
   await logAudit({ action: 'WITHDRAWAL_COMPLETED', entityType: 'withdrawal', entityId: withdrawal.id, performedBy: withdrawal.creator_id, metadata: { amount: withdrawal.amount } });
 
   try {
-    await email.withdrawalCompleted(withdrawal.profiles?.email, { amount: withdrawal.amount });
+    await email.withdrawalCompleted(withdrawal.profiles?.email, {
+      amount: withdrawal.amount,
+      bank_name: withdrawal.bank_name,
+      bank_last4: String(withdrawal.account_number || '').slice(-4),
+    });
   } catch {}
 }
 
+// No ledger entry is ever recorded for a withdrawal until this transfer.success
+// handler runs (see ledgerService.recordWithdrawalEntry), so a withdrawal that
+// fails or reverses before then never actually debited the campaign's balance
+// — calculateCampaignBalance only excludes amounts still 'pending'/'processing'.
+// Flipping the status away from those is all that's needed to "restore" it.
 async function handleTransferFailed(data) {
   const ref = data.reference;
   const { data: withdrawal } = await supabase
@@ -192,12 +235,36 @@ async function handleTransferFailed(data) {
     .update({ status: 'failed', updated_at: new Date().toISOString() })
     .eq('id', withdrawal.id);
 
-  await logAudit({ action: 'WITHDRAWAL_FAILED', entityType: 'withdrawal', entityId: withdrawal.id });
+  await logAudit({ action: 'WITHDRAWAL_FAILED', entityType: 'withdrawal', entityId: withdrawal.id, metadata: { reason: data.reason } });
 
   try {
     await email.withdrawalFailed(withdrawal.profiles?.email, { amount: withdrawal.amount, reason: data.reason });
     const { emailOnWithdrawal } = await getSettings();
     if (emailOnWithdrawal) await email.sendAdminAlert('Transfer failed', { withdrawal_id: withdrawal.id, amount: withdrawal.amount });
+  } catch {}
+}
+
+async function handleTransferReversed(data) {
+  const ref = data.reference;
+  const { data: withdrawal } = await supabase
+    .from('withdrawals')
+    .select('*, profiles(email)')
+    .eq('paystack_transfer_reference', ref)
+    .single();
+
+  if (!withdrawal) return;
+
+  await supabase
+    .from('withdrawals')
+    .update({ status: 'reversed', updated_at: new Date().toISOString() })
+    .eq('id', withdrawal.id);
+
+  await logAudit({ action: 'WITHDRAWAL_REVERSED', entityType: 'withdrawal', entityId: withdrawal.id, metadata: { reason: data.reason } });
+
+  try {
+    await email.withdrawalFailed(withdrawal.profiles?.email, { amount: withdrawal.amount, reason: data.reason || 'Transfer was reversed by the bank' });
+    const { emailOnWithdrawal } = await getSettings();
+    if (emailOnWithdrawal) await email.sendAdminAlert('Transfer reversed', { withdrawal_id: withdrawal.id, amount: withdrawal.amount });
   } catch {}
 }
 

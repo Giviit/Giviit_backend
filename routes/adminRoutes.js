@@ -4,6 +4,7 @@ const { authenticateUser } = require('../middleware/authenticateUser');
 const { requireAdmin } = require('../middleware/requireAdmin');
 const admin = require('../controllers/adminController');
 const { getAdminSettings, updateAdminSettings } = require('../controllers/settingsController');
+const { getCampaignDocumentsAdmin, reviewCampaignDocument } = require('../controllers/documentController');
 
 router.use(authenticateUser, requireAdmin);
 
@@ -16,6 +17,8 @@ router.get('/dashboard', admin.dashboardStats);
 
 // Campaigns
 router.get('/campaigns', admin.getAllCampaigns);
+router.get('/campaigns/:id/documents', getCampaignDocumentsAdmin);
+router.put('/campaigns/:id/documents/:doc_id', reviewCampaignDocument);
 router.put('/campaigns/:id/verify', admin.verifyCampaign);
 router.put('/campaigns/:id/reject', admin.rejectCampaign);
 router.put('/campaigns/:id/freeze', admin.freezeCampaign);
@@ -23,10 +26,11 @@ router.put('/campaigns/:id/fraudulent', admin.markFraudulent);
 router.put('/campaigns/:id/feature', admin.toggleFeature);
 router.put('/campaigns/:id/urgent', admin.toggleUrgent);
 
-// Withdrawals
+// Withdrawals — read-only + flag. Transfers now fire autonomously at
+// request time (withdrawalController.requestWithdrawal); there is no
+// approve/reject gate left for admins to act on.
 router.get('/withdrawals', admin.getWithdrawals);
-router.put('/withdrawals/:id/approve', admin.approveWithdrawal);
-router.put('/withdrawals/:id/reject', admin.rejectWithdrawal);
+router.put('/withdrawals/:id/flag', admin.flagWithdrawal);
 
 // Reports
 router.get('/reports', admin.getReports);

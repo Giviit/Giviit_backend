@@ -32,15 +32,19 @@ async function register(req, res, next) {
       return res.status(400).json({ error: 'You must confirm the accuracy of your information and agree to our Anti-Fraud Policy to create an account.' });
     }
 
-    const { data, error } = await supabase.auth.admin.createUser({
+    // Real signup (not the admin API) so Supabase sends its own verification
+    // email — this requires "Confirm email" to be enabled in the Supabase
+    // project's Auth settings (Authentication → Providers → Email).
+    const { data, error } = await createAuthClient().auth.signUp({
       email,
       password,
-      user_metadata: { full_name, phone, role: 'user' },
-      // No email-confirmation page exists yet — confirm immediately so the user
-      // can sign in right after registering instead of hitting a dead end.
-      email_confirm: true,
+      options: {
+        emailRedirectTo: `${process.env.FRONTEND_URL}/verify-email/success`,
+        data: { full_name, phone },
+      },
     });
     if (error) return res.status(400).json({ error: error.message });
+    if (!data.user) return res.status(400).json({ error: 'Registration failed' });
 
     const { data: profile, error: profileError } = await supabase.from('profiles').insert([{
       id: data.user.id,
@@ -53,6 +57,7 @@ async function register(req, res, next) {
       terms_version: CURRENT_TERMS_VERSION,
       identity_agreement_accepted: true,
       identity_agreement_accepted_at: new Date().toISOString(),
+      is_email_verified: false,
     }]).select().single();
 
     if (profileError) {
@@ -62,28 +67,54 @@ async function register(req, res, next) {
       return res.status(400).json({ error: profileError.message });
     }
 
-    // Auto-login: mint a real session so the frontend can go straight to the
-    // dashboard, the same way email/password login works. Uses a throwaway
-    // client — signing in on the shared service-role client would downgrade
-    // every later query on it to this user's (RLS-limited) permissions.
-    const { data: session, error: sessionError } = await createAuthClient().auth.signInWithPassword({ email, password });
-    if (sessionError) {
-      return res.status(201).json({ message: 'Account created. Please log in.' });
+    // If "Confirm email" is OFF in the Supabase project, signUp already
+    // returns a live session — the account is verified by definition, so log
+    // them straight in instead of showing a pointless "check your email" step.
+    if (data.session) {
+      await supabase.from('profiles').update({ is_email_verified: true, email_verified_at: new Date().toISOString() }).eq('id', data.user.id);
+      try {
+        await sendEmail({ to: email, subject: 'Welcome to Giviit', text: `Welcome ${full_name}! Your account has been created.` });
+      } catch {}
+      return res.status(201).json({
+        token: data.session.access_token,
+        refresh_token: data.session.refresh_token,
+        user: { id: data.user.id, email, ...profile, is_email_verified: true },
+      });
     }
 
+    res.status(201).json({ message: 'Check your email to verify your account', email });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// In-memory per-email rate limit for resend requests — a single backend
+// process, so this is enough to stop someone hammering the resend button
+// without needing a DB table just for counters.
+const resendAttempts = new Map();
+const RESEND_WINDOW_MS = 60 * 60 * 1000;
+const RESEND_MAX = 3;
+
+async function resendVerification(req, res, next) {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+
+    const now = Date.now();
+    const attempts = (resendAttempts.get(email) || []).filter((t) => now - t < RESEND_WINDOW_MS);
+    if (attempts.length >= RESEND_MAX) {
+      return res.status(429).json({ error: 'Too many resend attempts. Please try again in an hour.' });
+    }
+    attempts.push(now);
+    resendAttempts.set(email, attempts);
+
     try {
-      await sendEmail({
-        to: email,
-        subject: 'Welcome to Giviit',
-        text: `Welcome ${full_name}! Your account has been created.`,
-      });
+      await createAuthClient().auth.resend({ type: 'signup', email });
     } catch {}
 
-    res.status(201).json({
-      token: session.session.access_token,
-      refresh_token: session.session.refresh_token,
-      user: { id: data.user.id, email, ...profile },
-    });
+    // Same response regardless of outcome — avoids confirming/denying whether
+    // an email is registered or already verified.
+    res.json({ message: 'Verification email resent' });
   } catch (err) {
     next(err);
   }
@@ -95,7 +126,12 @@ async function login(req, res, next) {
     // Throwaway client — signing in on the shared service-role client would
     // downgrade every later query on it to this user's (RLS-limited) permissions.
     const { data, error } = await createAuthClient().auth.signInWithPassword({ email, password });
-    if (error) return res.status(400).json({ error: error.message });
+    if (error) {
+      if (error.code === 'email_not_confirmed' || /email not confirmed/i.test(error.message || '')) {
+        return res.status(403).json({ error: 'Please verify your email before logging in', code: 'EMAIL_NOT_VERIFIED', email });
+      }
+      return res.status(400).json({ error: error.message });
+    }
 
     // Get profile via the service-role client (bypasses RLS, never touched by sign-in)
     const { data: profile, error: profileError } = await supabase
@@ -105,6 +141,11 @@ async function login(req, res, next) {
       .single();
 
     if (profileError) return next(profileError);
+
+    if (!profile.is_email_verified) {
+      await supabase.from('profiles').update({ is_email_verified: true, email_verified_at: new Date().toISOString() }).eq('id', data.user.id);
+      profile.is_email_verified = true;
+    }
 
     if (!profile?.terms_agreed) {
       return res.status(403).json({
@@ -443,7 +484,7 @@ async function verifyIdentity(req, res, next) {
 async function updateProfile(req, res, next) {
   try {
     const userId = req.user.id;
-    const { full_name, phone, avatar_url, bank_name, bank_account_number, bank_account_name } = req.body;
+    const { full_name, phone, avatar_url, bank_name, bank_account_number, bank_account_name, cookie_consent } = req.body;
 
     const updates = {};
     if (full_name !== undefined) updates.full_name = full_name;
@@ -452,6 +493,10 @@ async function updateProfile(req, res, next) {
     if (bank_name !== undefined) updates.bank_name = bank_name;
     if (bank_account_number !== undefined) updates.bank_account_number = bank_account_number;
     if (bank_account_name !== undefined) updates.bank_account_name = bank_account_name;
+    if (cookie_consent !== undefined) {
+      updates.cookie_consent = cookie_consent;
+      updates.cookie_consent_at = new Date().toISOString();
+    }
 
     const { data: profile, error } = await supabase
       .from('profiles')
@@ -469,4 +514,4 @@ async function updateProfile(req, res, next) {
   }
 }
 
-module.exports = { register, login, logout, forgotPassword, resetPassword, refreshToken, googleRedirect, googleBridge, googleSync, me, updateProfile, verifyIdentity, submitBanAppeal };
+module.exports = { register, login, logout, forgotPassword, resetPassword, refreshToken, resendVerification, googleRedirect, googleBridge, googleSync, me, updateProfile, verifyIdentity, submitBanAppeal };

@@ -16,6 +16,7 @@
     "express": "^4.18.2",
     "express-rate-limit": "^6.8.0",
     "jsonwebtoken": "^9.0.2",
+    "node-cron": "^4.5.0",
     "nodemailer": "^6.9.4",
     "pdfkit": "^0.19.1",
     "uuid": "^9.0.1",

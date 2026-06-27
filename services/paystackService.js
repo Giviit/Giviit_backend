@@ -17,16 +17,19 @@ function getClient() {
   return client;
 }
 
-async function initiateTransaction({ email, amount, campaign_id, donor_name, is_anonymous, message, prayer, currency }) {
+async function initiateTransaction({ email, amount, campaign_id, donor_name, is_anonymous, message, prayer, currency, callbackPath, channels }) {
   const ref = `GIVIIT_DON_${campaign_id.slice(0, 8)}_${Date.now()}`;
   const body = {
     email,
     amount: Math.round(Number(amount) * 100),
     reference: ref,
     currency: currency || 'NGN',
-    callback_url: `${process.env.FRONTEND_URL}/donate/success`,
+    callback_url: `${process.env.FRONTEND_URL}${callbackPath || '/donate/success'}`,
     metadata: { campaign_id, donor_name, is_anonymous, message, prayer },
   };
+  // Restricts the Paystack-hosted checkout page to a single payment method —
+  // e.g. ['bank_transfer'] shows only the dynamic virtual account, no card form.
+  if (channels && channels.length) body.channels = channels;
   const { data } = await getClient().post('/transaction/initialize', body);
   return data.data;
 }
@@ -72,6 +75,13 @@ async function getBalance() {
   return balance ? Number(balance.balance) / 100 : 0;
 }
 
+async function resolveAccount({ account_number, bank_code }) {
+  const { data } = await getClient().get('/bank/resolve', {
+    params: { account_number, bank_code },
+  });
+  return data.data;
+}
+
 module.exports = {
   initiateTransaction,
   verifyTransaction,
@@ -79,4 +89,5 @@ module.exports = {
   createTransferRecipient,
   transferToRecipient,
   getBalance,
+  resolveAccount,
 };

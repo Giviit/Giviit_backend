@@ -1,39 +1,116 @@
 const { supabase } = require('../utils/supabaseClient');
-const { initiateTransaction, verifyTransaction } = require('../services/paystackService');
+const { initiateTransaction, verifyTransaction, initiateRefund } = require('../services/paystackService');
 const { recordDonationEntries } = require('../services/ledgerService');
 const { getSettings } = require('../services/settingsService');
+const { advancePledge } = require('../services/pledgeService');
 const { logAudit } = require('../utils/auditLog');
 const email = require('../services/emailService');
+const { capAmount, handleGoalReached } = require('../services/overfundingService');
+
+// Maps a donor-facing payment method to the Paystack `channels` array that
+// restricts the hosted checkout page to just that one method.
+const PAYMENT_CHANNELS = {
+  card: ['card'],
+  bank_transfer: ['bank_transfer'],
+  ussd: ['ussd'],
+};
+const BANK_TRANSFER_EXPIRY_MS = 30 * 60 * 1000;
+const DEFAULT_EXPIRY_MS = 24 * 60 * 60 * 1000;
 
 async function initiateDonation(req, res, next) {
   try {
-    const { campaign_id, donor_name, donor_email, amount, is_anonymous, message } = req.body;
+    const { campaign_id, donor_name, donor_email, amount, is_anonymous, message, payment_channel } = req.body;
     if (!campaign_id || !donor_email || !amount) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
+    const channel = payment_channel || 'card';
+    if (!PAYMENT_CHANNELS[channel]) {
+      return res.status(400).json({ error: 'Invalid payment method', code: 'INVALID_CHANNEL' });
+    }
+
+    const { data: campaign } = await supabase
+      .from('campaigns')
+      .select('raised_amount, goal_amount')
+      .eq('id', campaign_id)
+      .single();
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+
+    const goalAmount = Number(campaign.goal_amount || 0);
+    const raisedAmount = Number(campaign.raised_amount || 0);
+    if (goalAmount && raisedAmount >= goalAmount) {
+      return res.status(400).json({
+        error: 'This campaign has reached its goal and is no longer accepting donations.',
+        code: 'GOAL_REACHED',
+      });
+    }
+
+    // Cap the charge at the remaining balance so a donor can never push a
+    // campaign past its goal — overfunding is disallowed platform-wide.
+    const { cappedAmount } = capAmount(Number(amount), raisedAmount, goalAmount);
+
     const paystackData = await initiateTransaction({
       email: donor_email,
-      amount: Number(amount),
+      amount: cappedAmount,
       campaign_id,
       donor_name,
       is_anonymous,
       message,
+      channels: PAYMENT_CHANNELS[channel],
     });
+
+    // Bank transfer windows close fast (Paystack's dynamic virtual account
+    // expires in ~30 min); card/USSD pending charges get a generous 24h
+    // before the cleanup cron marks them expired.
+    const expiryMs = channel === 'bank_transfer' ? BANK_TRANSFER_EXPIRY_MS : DEFAULT_EXPIRY_MS;
+    const paymentExpiresAt = new Date(Date.now() + expiryMs).toISOString();
 
     await supabase.from('donations').insert([{
       campaign_id,
       donor_name: donor_name || 'Anonymous',
       donor_email,
-      amount: Number(amount),
+      amount: cappedAmount,
       currency: 'NGN',
       is_anonymous: !!is_anonymous,
       message: message || null,
       paystack_reference: paystackData.reference,
       paystack_status: 'pending',
+      payment_channel: channel,
+      payment_expires_at: paymentExpiresAt,
     }]);
 
-    res.json({ authorization_url: paystackData.authorization_url, reference: paystackData.reference });
+    res.json({
+      authorization_url: paystackData.authorization_url,
+      reference: paystackData.reference,
+      amount: cappedAmount,
+      capped: cappedAmount < Number(amount),
+      payment_channel: channel,
+      payment_expires_at: paymentExpiresAt,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getDonationStatus(req, res, next) {
+  try {
+    const { reference } = req.params;
+    const { data, error } = await supabase
+      .from('donations')
+      .select('paystack_status, payment_channel, payment_expires_at, amount, currency')
+      .eq('paystack_reference', reference)
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Donation not found' });
+
+    res.json({
+      status: data.paystack_status,
+      payment_channel: data.payment_channel,
+      payment_expires_at: data.payment_expires_at,
+      amount: data.amount,
+      currency: data.currency,
+    });
   } catch (err) {
     next(err);
   }
@@ -87,22 +164,43 @@ async function verifyDonation(req, res, next) {
     if (donation && status === 'success') {
       const { data: campaign } = await supabase
         .from('campaigns')
-        .select('raised_amount, donor_count, creator_id, title, slug, goal_amount')
+        .select('id, raised_amount, donor_count, creator_id, title, slug, goal_amount, goal_reached_at')
         .eq('id', donation.campaign_id)
         .single();
 
       if (campaign) {
-        const newRaised = Number(campaign.raised_amount || 0) + Number(donation.amount);
+        const previousRaised = Number(campaign.raised_amount || 0);
+        const goalAmount = Number(campaign.goal_amount || 0);
+
+        // Defensive re-cap: the donation should already be at-or-under the
+        // remaining balance (initiateDonation capped it), but a concurrent
+        // donation finishing first could still push us over — refund any excess.
+        const { cappedAmount, excessAmount } = capAmount(Number(donation.amount), previousRaised, goalAmount);
+        if (excessAmount > 0) {
+          try {
+            await initiateRefund({ transaction: reference, amount: excessAmount });
+          } catch (err) {
+            console.error('[overfunding] Failed to refund excess donation amount:', err.message);
+          }
+        }
+
+        const newRaised = previousRaised + cappedAmount;
         await supabase.from('campaigns').update({
           raised_amount: newRaised,
           donor_count: Number(campaign.donor_count || 0) + 1,
         }).eq('id', donation.campaign_id);
 
         try {
+          await handleGoalReached({ campaign, newRaised });
+        } catch (err) {
+          console.error('[overfunding] handleGoalReached failed:', err.message);
+        }
+
+        try {
           await recordDonationEntries({
             userId: campaign.creator_id,
             campaignId: donation.campaign_id,
-            amount: donation.amount,
+            amount: cappedAmount,
             donationId: donation.id,
             paystackReference: reference,
           });
@@ -114,20 +212,21 @@ async function verifyDonation(req, res, next) {
           action: 'DONATION_SUCCEEDED',
           entityType: 'donation',
           entityId: donation.id,
-          metadata: { campaign_id: donation.campaign_id, amount: donation.amount, paystack_reference: reference },
+          metadata: { campaign_id: donation.campaign_id, amount: cappedAmount, gross_amount: donation.amount, paystack_reference: reference },
         });
 
         const campaignUrl = `${process.env.FRONTEND_URL}/campaign/${campaign.slug || ''}`;
         try {
           await email.donorReceipt(donation.donor_email, {
             campaign_title: campaign.title || 'your campaign',
-            amount: donation.amount,
+            amount: cappedAmount,
             reference,
             campaign_url: campaignUrl,
             donor_name: donation.donor_name,
             is_anonymous: donation.is_anonymous,
             currency: donation.currency,
             donated_at: donation.created_at,
+            payment_channel: donation.payment_channel,
           });
         } catch {}
 
@@ -137,7 +236,7 @@ async function verifyDonation(req, res, next) {
             await email.creatorDonationReceived(creator.email, {
               donor_name: donation.donor_name,
               is_anonymous: donation.is_anonymous,
-              amount: donation.amount,
+              amount: cappedAmount,
               campaign_title: campaign.title,
               campaign_url: campaignUrl,
               total_raised: newRaised,
@@ -145,6 +244,14 @@ async function verifyDonation(req, res, next) {
             });
           }
         } catch {}
+
+        if (donation.pledge_id) {
+          try {
+            await advancePledge(donation.pledge_id);
+          } catch (err) {
+            console.error('[pledge] Failed to advance pledge:', err.message);
+          }
+        }
       }
     }
 
@@ -155,10 +262,17 @@ async function verifyDonation(req, res, next) {
       .eq('id', existing.campaign_id)
       .single();
 
+    let pledge = null;
+    if (existing.pledge_id) {
+      const { data: pledgeRow } = await supabase.from('pledges').select('*').eq('id', existing.pledge_id).single();
+      pledge = pledgeRow;
+    }
+
     res.json({
       status: settled.paystack_status,
       donation: settled,
       campaign,
+      pledge,
     });
   } catch (err) {
     next(err);
@@ -300,6 +414,7 @@ async function getDiasporaDonors(req, res, next) {
 module.exports = {
   initiateDonation,
   verifyDonation,
+  getDonationStatus,
   getCampaignDonations,
   getMyDonations,
   logOfflineDonation,
